@@ -1,0 +1,2456 @@
+// ==UserScript==
+// @name         Fullscreen Exit Bypass & Anti-Proctoring Suite
+// @namespace    local.userscripts.fullscreen
+// @version      3.2.0
+// @description  Скрывает от страницы выход из полноэкранного режима, потерю фокуса, переключение вкладок, уход курсора и все сопутствующие каналы детекта прокторинга
+// @match        *://*/*
+// @match        file:///*
+// @run-at       document-start
+// @grant        none
+// @all-frames   true
+// ==/UserScript==
+
+/*
+  Changelog v3.2.0:
+  - Поддержка браузерного F11-fullscreen: F11 не вызывает Fullscreen API и
+    fullscreenchange, поэтому раньше подмена при выходе по F11 не включалась.
+    Теперь resize-детектор (по нативным размерам окна) распознаёт вход по F11
+    и включает "dims-only" сессию: подменяются размеры/бары/хит-тест, но
+    document.fullscreenElement остаётся нативным (null), как и при реальном F11.
+    Выход по F11 страница не видит (размеры остаются экранными).
+  - exitFullscreen() страницы больше не роняет F11-сессию.
+  - HUD показывает режим: ON (API) / F11.
+
+  Changelog v3.1.0:
+  - trustOnly: глушатся только доверенные (isTrusted=true) события. Синтетические
+    self-test'ы страницы (dispatchEvent(new Event('blur'|'fullscreenchange'|...)))
+    проходят и видят согласованное фейковое состояние -> детект подмены не срабатывает.
+  - Уход курсора: глушатся и pointer-события (pointerleave/pointerout), не только mouse*.
+  - Бар-свойства окна: toolbar/menubar/locationbar/personalbar/scrollbars/statusbar
+    .visible === false пока активен fullscreen (в оконном режиме true -> палило эмуляцию).
+  - elementFromPoint/elementsFromPoint: точки за пределами реального окна (но в пределах
+    экрана) возвращают fullscreen-элемент вместо null (в реальном FS документ там есть).
+  - Мульти-мониторы: screen.isExtended = false, getScreenDetails() отклоняется.
+  - navigator.keyboard.lock()/unlock() эмулируются без реальной блокировки клавиатуры.
+  - requestIdleCallback и IntersectionObserver не замирают в скрытой вкладке
+    (нативно они привязаны к рендерингу и останавливаются -> канал детекта "тишины").
+  - Исправлен TDZ-баг v3.0.0: sanitizeOnProps вызывался из секции video до объявления.
+  - Обёртки слушателей наследуют имя оригинала (меньше следов в stack traces).
+
+  Changelog v3.0.0 (относительно v2.1.0):
+
+  ИСПРАВЛЕНО:
+  - smartBlur больше не глушит элементные blur/focusout при активном окне (правило
+    currentTarget===window/document ломало дропдауны и валидацию инпутов). Теперь
+    элементные события глушатся только если окно реально потеряло фокус (нативный hasFocus).
+  - mouseout/mouseleave у края окна больше не глушатся при переходе между элементами
+    внутри страницы (boundary-проверка только при уходе курсора из окна).
+  - overrideEverywhere: в Firefox own-свойство на window с nativeGet=null навсегда
+    портило innerWidth/scrollX и др. Теперь нативный геттер резолвится один раз
+    (window || Window.prototype) и переиспользуется для всех целей.
+  - Собственные слушатели userscript (visHooks) регистрируются ДО capture-suppressor,
+    иначе stopImmediatePropagation глушыл и их (баг keepRaf в v2).
+  - querySelectorAll/matches корректно обрабатывают :not(:fullscreen) и составные
+    селекторы вида "div:fullscreen .child" (раньше возвращался пустой список).
+  - Синтетические события (fullscreenchange и др.) помечаются isTrusted=true.
+  - HUD/тосты больше не создаются в каждом iframe — только в топ-фрейме.
+  - window.__fseBypassInstalled и API больше не enumerable (меньше палева).
+
+  ДОБАВЛЕНО:
+  - Глушение window focus/focusin (парный к blur: страница не видит возврат фокуса).
+  - Подмена scrollHeight/scrollWidth/scrollLeft/scrollTop, scrollX/scrollY/
+    pageXOffset/pageYOffset/scrollMax* (утечка контентной высоты и прокрутки).
+  - document.currentFullscreenElement (новое имя в Chrome 129+).
+  - Эмуляция video-webkit-fullscreen API (webkitDisplayingFullscreen,
+    webkitEnterFullscreen/ExitFullscreen, webkitbegin/endfullscreen).
+  - Патч exitPointerLock: программный выход страницы отрабатывает корректно
+    (синтетический pointerlockchange), пользовательский Esc по-прежнему скрыт.
+  - normalizeTimers: worker-таймеры для скрытой вкладки — защита от дрейф-детекта
+    троттлинга setTimeout/setInterval (классический канал "страница в фоне").
+  - crossFrameSync: same-origin iframe'ы синхронизируют состояние с топ-фреймом.
+  - matchMedia: понимает dvh/svh/lvh/dvw/svw/lvw/vmin/vmax единицы.
+*/
+
+(() => {
+  'use strict';
+
+  if (window.__fseBypassInstalled) return;
+  try {
+    Object.defineProperty(window, '__fseBypassInstalled', {
+      value: true, writable: false, enumerable: false, configurable: false
+    });
+  } catch (_) { window.__fseBypassInstalled = true; }
+
+  /* ============================== 0. НАСТРОЙКИ ============================== */
+  const CFG = {
+    // --- Полноэкранный режим (Fullscreen) ---
+    fullscreen: true,                 // подмена document.fullscreenElement, webkit/moz/ms/current свойств
+    mockFullscreenRequest: false,     // если true: при вызове el.requestFullscreen() НЕ запрашивать настоящий экранный режим, а сразу эмулировать успех
+    fallbackToFakeOnReject: true,     // если настоящий requestFullscreen() отклонен браузером или отменен, переходить в режим эмуляции
+    autoFakeOnStart: false,           // сразу считать страницу в полноэкранном режиме с момента загрузки
+    autoDetectF11: true,              // авто-детект браузерного F11-fullscreen (окно стало размером с экран) -> dims-only подмена
+    blockExitFullscreen: false,       // игнорировать программный вызов exitFullscreen() со стороны страницы
+    suppressAllResizeInFake: true,    // полностью глушить события resize пока активен фейковый fullscreen
+    videoFullscreenApi: true,         // эмуляция HTMLVideoElement.webkit*-fullscreen API (Safari-стиль видео-плееры)
+
+    // --- Фокус, вкладки и переключение окон (Anti-AltTab / Defocus) ---
+    smartBlur: true,                  // глушить blur/focusout при уходе фокуса из окна, НЕ ломая дропдауны и инпуты внутри страницы
+    suppressWindowFocus: true,        // глушить window focus/focusin (возврат фокуса), чтобы страница не видела пару "ушел-вернулся"
+    visibility: true,                 // visibilityState = 'visible', document.hidden = false, глушить visibilitychange (+ freeze/resume/pagehide)
+    alwaysHasFocus: true,             // document.hasFocus() всегда возвращает true
+
+    // --- Мышь и курсор (Mouse / Pointer) ---
+    pointerLock: true,                // сохранение fakePointerLockElement + корректный программный exitPointerLock
+    mouseLeave: true,                 // глушить mouseleave / mouseout при выходе курсора за пределы окна/монитора
+
+    // --- Клавиатурные ловушки ---
+    escapeKey: true,                  // глушить клавишу Escape пока страница в fullscreen
+    suppressF11: false,               // глушить клавишу F11 от перехвата страницей
+    suppressAltTabKeys: false,        // глушить одиночные нажатия Alt/Meta, используемые для детекта Alt+Tab
+    bypassKeyboardLock: true,         // navigator.keyboard.lock()/unlock() эмулируются без реальной блокировки клавиатуры
+
+    // --- Защита от блокировки копирования/контекстного меню ---
+    allowClipboard: true,             // запретить странице блокировать copy/cut/paste
+    allowContextMenu: true,           // запретить странице блокировать правый клик (contextmenu)
+    allowSelection: true,             // разблокировать выделение текста (selectstart, user-select)
+
+    // --- Геометрия, Селекторы и ResizeObserver ---
+    spoofDimensions: true,            // подмена inner/outer/screenX/screenY/avail*, visualViewport, getBoundingClientRect
+    spoofScrollMetrics: true,         // scrollHeight/scrollWidth/scrollLeft/scrollTop html/body + scrollX/scrollY/page*Offset/scrollMax* => экранные
+    spoofMediaQueries: true,          // matchMedia (display-mode, width, height, orientation, современный range-синтаксис, dvh/dvw единицы)
+    spoofFullscreenSelector: true,    // псевдокласс :fullscreen в matches/querySelector/querySelectorAll (с возвратом настоящего NodeList)
+    observerSpoof: true,              // подставлять экранные размеры в ResizeObserver
+    spoofBarProps: true,              // window.toolbar/menubar/... .visible === false в fullscreen (панели браузера скрыты)
+    spoofHitTesting: true,            // elementFromPoint/elementsFromPoint вне реального окна возвращают fullscreen-элемент
+    spoofScreenExtended: true,        // screen.isExtended = false, getScreenDetails() отклоняется (скрыть мульти-мониторы)
+    resizeAfterExit: true,            // глушить всплеск resize после реального выхода
+    resizeWindowMs: 1500,             // окно подавления после выхода (мс)
+
+    // --- Анти-детект и среда выполнения ---
+    maskNative: true,                 // маскировка подмененых функций под [native code] в Function.prototype.toString
+    forgeIsTrusted: true,             // синтетические события от скрипта получают isTrusted=true
+    protectRealms: true,              // санитизация iframe/frame-контекстов (синхронно через appendChild и через getters)
+    normalizeTimers: true,            // worker-таймеры в скрытой вкладке: нет троттлинга setTimeout/setInterval (анти дрейф-детект)
+    spoofIdleCallback: true,          // requestIdleCallback не замирает в скрытой вкладке
+    spoofIntersectionObserver: true,  // IntersectionObserver продолжает присылать колбэки в скрытой вкладке
+    crossFrameSync: true,             // same-origin дочерние фреймы наследуют состояние сессии топ-фрейма
+    keepRaf: false,                   // непрерывный rAF в скрытой вкладке (качает анимации в фоне)
+    shieldCspViolations: true,        // блокировать утечку событий securitypolicyviolation для античитов
+    trustOnly: true,                  // глушить только isTrusted-события: синтетические self-test'ы страницы проходят и видят согласованное состояние
+
+    // --- Интерфейс и управление ---
+    hotkeys: true,                    // горячие клавиши: Ctrl+Alt+F (FS toggle), Ctrl+Alt+B (Blur toggle), Ctrl+Alt+H (HUD toggle)
+    hudBadge: true,                   // плавающий ненавязчивый индикатор статуса в углу экрана (только в топ-фрейме)
+    debug: false                      // логировать события в консоль
+  };
+  /* ========================================================================== */
+
+  const FS_EVENTS = new Set([
+    'fullscreenchange', 'webkitfullscreenchange', 'mozfullscreenchange', 'MSFullscreenChange',
+    'fullscreenerror', 'webkitfullscreenerror', 'mozfullscreenerror', 'MSFullscreenError'
+  ]);
+  const PL_EVENTS = new Set([
+    'pointerlockchange', 'webkitpointerlockchange', 'mozpointerlockchange',
+    'pointerlockerror', 'webkitpointerlockerror', 'mozpointerlockerror'
+  ]);
+  const VIDEO_FS_EVENTS = new Set(['webkitbeginfullscreen', 'webkitendfullscreen']);
+  const VIS_EVENTS = new Set(['visibilitychange', 'webkitvisibilitychange']);
+  const LIFECYCLE_EVENTS = new Set(['freeze', 'resume', 'pagehide']);
+  const FOCUS_EVENTS = new Set(['blur', 'focusout']);
+  const FOCUS_GAIN_EVENTS = new Set(['focus', 'focusin']);
+  const MOUSE_LEAVE_EVENTS = new Set(['mouseleave', 'mouseout', 'pointerleave', 'pointerout']);
+  const KEY_EVENTS = new Set(['keydown', 'keyup', 'keypress']);
+
+  const dbg = (...args) => { if (CFG.debug) console.debug('[fse-bypass]', ...args); };
+  let suppressedCount = 0;
+
+  /* ==================== 1. МАСКИРОВКА ПОД НАТИВНЫЙ КОД ==================== */
+  const nativeToString = Function.prototype.toString;
+  const maskedSources = new WeakMap();
+  let patchedToString = null;
+
+  const maskFn = (fn, source) => {
+    if (CFG.maskNative && typeof fn === 'function') maskedSources.set(fn, source);
+    return fn;
+  };
+
+  const makeMethod = (name, impl) => {
+    const holder = { [name](...args) { return impl.apply(this, args); } };
+    return holder[name];
+  };
+
+  const makeGetter = (prop, impl) => {
+    const holder = { get [prop]() { return impl.call(this); } };
+    return Object.getOwnPropertyDescriptor(holder, prop).get;
+  };
+
+  const setFnMeta = (fn, name, length) => {
+    try { Object.defineProperty(fn, 'name', { value: name, configurable: true }); } catch (_) {}
+    if (typeof length === 'number') {
+      try { Object.defineProperty(fn, 'length', { value: length, configurable: true }); } catch (_) {}
+    }
+    return fn;
+  };
+
+  if (CFG.maskNative) {
+    patchedToString = makeMethod('toString', function () {
+      const fake = maskedSources.get(this);
+      return fake !== undefined ? fake : nativeToString.call(this);
+    });
+    setFnMeta(patchedToString, 'toString', 0);
+    maskedSources.set(patchedToString, 'function toString() { [native code] }');
+    Function.prototype.toString = patchedToString;
+  }
+
+  /* ==================== 2. НАТИВНЫЕ ССЫЛКИ ==================== */
+  const nativeAdd = EventTarget.prototype.addEventListener;
+  const nativeRemove = EventTarget.prototype.removeEventListener;
+
+  const nativePropGetter = (obj, prop) => {
+    try {
+      const d = Object.getOwnPropertyDescriptor(obj, prop);
+      return d && typeof d.get === 'function' ? d.get : null;
+    } catch (_) { return null; }
+  };
+
+  const nativeFsGetter = nativePropGetter(Document.prototype, 'fullscreenElement')
+    || nativePropGetter(Document.prototype, 'webkitFullscreenElement');
+  const nativePlGetter = nativePropGetter(Document.prototype, 'pointerLockElement')
+    || nativePropGetter(Document.prototype, 'webkitPointerLockElement');
+
+  const realFullscreenElement = () => {
+    if (!nativeFsGetter) return null;
+    try { return nativeFsGetter.call(document); } catch (_) { return null; }
+  };
+  const realPointerLockElement = () => {
+    if (!nativePlGetter) return null;
+    try { return nativePlGetter.call(document); } catch (_) { return null; }
+  };
+
+  const nativeHiddenGetter = nativePropGetter(Document.prototype, 'hidden')
+    || nativePropGetter(Document.prototype, 'webkitHidden');
+  const realHidden = () => {
+    if (!nativeHiddenGetter) return false;
+    try { return !!nativeHiddenGetter.call(document); } catch (_) { return false; }
+  };
+
+  // Нативные размеры вьюпорта ДО подмены (детектор F11)
+  const nWinIW = nativePropGetter(window, 'innerWidth')
+    || (typeof Window !== 'undefined' && nativePropGetter(Window.prototype, 'innerWidth')) || null;
+  const nWinIH = nativePropGetter(window, 'innerHeight')
+    || (typeof Window !== 'undefined' && nativePropGetter(Window.prototype, 'innerHeight')) || null;
+
+  // Нативный hasFocus захватываем ДО его подмены (используется в smartBlur)
+  const nativeHasFocusFn = (typeof Document !== 'undefined' && typeof Document.prototype.hasFocus === 'function')
+    ? Document.prototype.hasFocus
+    : null;
+  const realHasFocus = () => {
+    try { return nativeHasFocusFn ? nativeHasFocusFn.call(document) : true; } catch (_) { return true; }
+  };
+
+  const isTopFrame = (() => {
+    try { return window.top === window; } catch (_) { return true; }
+  })();
+
+  const ScreenProto = typeof Screen === 'function' ? Screen.prototype : null;
+  const nScreen = ScreenProto ? {
+    width: nativePropGetter(ScreenProto, 'width'),
+    height: nativePropGetter(ScreenProto, 'height'),
+    availWidth: nativePropGetter(ScreenProto, 'availWidth'),
+    availHeight: nativePropGetter(ScreenProto, 'availHeight'),
+    availLeft: nativePropGetter(ScreenProto, 'availLeft'),
+    availTop: nativePropGetter(ScreenProto, 'availTop')
+  } : {};
+
+  const buildRect = (w, h) => {
+    try { return new DOMRect(0, 0, w, h); } catch (_) {}
+    const rect = { x: 0, y: 0, width: w, height: h, top: 0, left: 0, right: w, bottom: h };
+    rect.toJSON = () => ({ x: 0, y: 0, width: w, height: h, top: 0, left: 0, right: w, bottom: h });
+    return rect;
+  };
+
+  // Полноценная эмуляция NodeList для querySelectorAll
+  const makeNodeList = (elements) => {
+    const proto = (typeof NodeList !== 'undefined' && NodeList.prototype) || Object.prototype;
+    const nl = Object.create(proto);
+    for (let i = 0; i < elements.length; i++) {
+      nl[i] = elements[i];
+    }
+    Object.defineProperty(nl, 'length', {
+      value: elements.length,
+      writable: false,
+      enumerable: false,
+      configurable: true
+    });
+    nl.item = maskFn(function (index) {
+      const idx = Number(index);
+      return (idx >= 0 && idx < elements.length) ? elements[idx] : null;
+    }, 'function item() { [native code] }');
+    nl.forEach = maskFn(function (callback, thisArg) {
+      elements.forEach(callback, thisArg);
+    }, 'function forEach() { [native code] }');
+    nl[Symbol.iterator] = maskFn(function () {
+      return elements[Symbol.iterator]();
+    }, 'function values() { [native code] }');
+    nl.entries = maskFn(function () { return elements.entries(); }, 'function entries() { [native code] }');
+    nl.keys = maskFn(function () { return elements.keys(); }, 'function keys() { [native code] }');
+    nl.values = maskFn(function () { return elements.values(); }, 'function values() { [native code] }');
+    try {
+      Object.defineProperty(nl, Symbol.toStringTag, { value: 'NodeList', configurable: true });
+    } catch (_) {}
+    return nl;
+  };
+
+  /* ==================== 3. СОСТОЯНИЕ И ЭМУЛЯЦИЯ СЕССИИ ==================== */
+  let sessionActive = CFG.autoFakeOnStart;
+  let sessionMode = CFG.autoFakeOnStart ? 'api' : null; // 'api' | 'f11' | null
+  let fakeFullscreenEl = CFG.autoFakeOnStart ? (document.documentElement || null) : null;
+  let fakePointerLockEl = null;
+  let lastRealExit = 0;
+  let wasRealFs = false;
+  let syntheticPass = 0;            // >0 пока диспатчатся наши синтетические события (пропуск глушения)
+  const forgedEvents = new WeakSet(); // события, для которых isTrusted должен быть true
+
+  const activateSession = (el, mode = 'api') => {
+    sessionActive = true;
+    sessionMode = mode;
+    fakeFullscreenEl = mode === 'api' ? (el || fakeFullscreenEl || document.documentElement || null) : null;
+    dbg('session activated (' + mode + '), fakeFullscreenEl:', fakeFullscreenEl);
+    updateHud();
+  };
+
+  const deactivateSession = () => {
+    sessionActive = false;
+    sessionMode = null;
+    fakeFullscreenEl = null;
+    wasRealFs = false;
+    dbg('session deactivated');
+    updateHud();
+  };
+
+  // API-fullscreen (в отличие от F11-режима): подменяем document.fullscreenElement
+  // и псевдокласс :fullscreen. В F11-режиме эти свойства остаются нативными (null),
+  // потому что при реальном F11 они тоже null — подмена выдала бы себя.
+  const apiFsActive = () => sessionMode === 'api' || !!fakeFullscreenEl || !!realFullscreenElement();
+
+  // Синхронизация с топ-фреймом (только same-origin; кросс-домен кидает SecurityError)
+  let topApi = null;
+  let topChecked = false;
+  const topSpoofActive = () => {
+    if (!CFG.crossFrameSync || isTopFrame) return false;
+    if (!topChecked) {
+      topChecked = true;
+      try {
+        if (window.top !== window && window.top.__fseBypass) topApi = window.top.__fseBypass;
+      } catch (_) {}
+    }
+    try { return !!(topApi && topApi.isSpoofActive); } catch (_) { topApi = null; topChecked = false; return false; }
+  };
+
+  // Активен ли режим подмены
+  const isSpoofActive = () => {
+    return sessionActive || !!fakeFullscreenEl || !!realFullscreenElement() || topSpoofActive();
+  };
+
+  const fakeActive = () => {
+    return isSpoofActive() && !realFullscreenElement();
+  };
+
+  // Диспатч синтетического события с пропуском глушения и isTrusted=true
+  const dispatchForged = (target, type) => {
+    syntheticPass++;
+    try {
+      const e = new Event(type, { bubbles: true, cancelable: false });
+      forgedEvents.add(e);
+      (target || document).dispatchEvent(e);
+      if (target && target !== document && target !== window) {
+        const e2 = new Event(type, { bubbles: true, cancelable: false });
+        forgedEvents.add(e2);
+        document.dispatchEvent(e2);
+      }
+    } catch (_) {} finally { syntheticPass--; }
+  };
+
+  /* ==================== 4. СЛУЖЕБНЫЕ СЛУШАТЕЛИ ==================== */
+  // ВАЖНО: все собственные слушатели регистрируются ДО установки capture-suppressor,
+  // иначе stopImmediatePropagation заглушит и их (баг v2 в keepRaf).
+
+  const visHooks = []; // подписчики на смену реальной видимости (таймеры, rAF)
+  try {
+    nativeAdd.call(document, 'visibilitychange', () => {
+      const hidden = realHidden();
+      for (const h of visHooks) { try { h(hidden); } catch (_) {} }
+    }, true);
+  } catch (_) {}
+
+  // Детектор браузерного F11-fullscreen (без Fullscreen API): окно стало размером
+  // с экран. Включает "dims-only" сессию — подменяем размеры/бары/хит-тест,
+  // но НЕ fullscreenElement (при реальном F11 он null). Слушатель нативный и
+  // зарегистрирован ДО capture-suppressor, поэтому глушение resize его не касается.
+  const f11CoversScreen = () => {
+    try {
+      if (!nWinIW || !nWinIH) return false;
+      const w = nWinIW.call(window);
+      const h = nWinIH.call(window);
+      return Math.abs(w - screen.width) <= 2 && Math.abs(h - screen.height) <= 2;
+    } catch (_) { return false; }
+  };
+  let f11Active = false;
+  const checkF11 = () => {
+    if (realFullscreenElement()) { f11Active = false; return; }
+    const full = f11CoversScreen();
+    if (full && !f11Active) {
+      f11Active = true;
+      if (CFG.autoDetectF11 && !sessionActive) {
+        activateSession(document.documentElement, 'f11');
+        showToast('F11 fullscreen: подмена размеров включена');
+      }
+    } else if (!full && f11Active) {
+      f11Active = false;
+      if (sessionMode === 'f11') {
+        lastRealExit = Date.now();
+        dbg('F11 exit detected, keeping dims-only session active');
+        updateHud();
+      }
+    }
+  };
+  try {
+    nativeAdd.call(window, 'resize', checkF11, true);
+    checkF11();
+    nativeAdd.call(document, 'DOMContentLoaded', checkF11, { once: true });
+    nativeAdd.call(window, 'load', checkF11, { once: true });
+  } catch (_) {}
+
+  const watchFullscreen = () => {
+    const el = realFullscreenElement();
+    if (el) {
+      wasRealFs = true;
+      activateSession(el);
+      dbg('real fullscreen entered:', el);
+    } else if (wasRealFs) {
+      wasRealFs = false;
+      lastRealExit = Date.now();
+      dbg('real exit from fullscreen detected, keeping sessionActive = true');
+      updateHud();
+    }
+  };
+
+  FS_EVENTS.forEach((type) => {
+    try { nativeAdd.call(document, type, watchFullscreen, true); } catch (_) {}
+    try { nativeAdd.call(window, type, watchFullscreen, true); } catch (_) {}
+  });
+
+  PL_EVENTS.forEach((type) => {
+    try {
+      nativeAdd.call(document, type, () => {
+        const el = realPointerLockElement();
+        if (el) fakePointerLockEl = el;
+      }, true);
+    } catch (_) {}
+  });
+
+  /* ==================== 5. ПРАВИЛА ПОДАВЛЕНИЯ СОБЫТИЙ ==================== */
+  const isWindowOrDoc = (target) => {
+    return !target || target === window || target === document
+      || target === document.documentElement || target === document.body;
+  };
+
+  const shouldSuppressKeyEvent = (event) => {
+    if (!event) return false;
+    const key = event.key || '';
+    const code = event.code || '';
+    const keyCode = event.keyCode || 0;
+
+    if (CFG.escapeKey && (key === 'Escape' || key === 'Esc' || code === 'Escape' || keyCode === 27)) {
+      return isSpoofActive();
+    }
+    if (CFG.suppressF11 && (key === 'F11' || code === 'F11' || keyCode === 122)) {
+      return true;
+    }
+    if (CFG.suppressAltTabKeys && (key === 'Alt' || key === 'Meta' || code === 'AltLeft' || code === 'AltRight' || keyCode === 18)) {
+      return true;
+    }
+    return false;
+  };
+
+  const shouldSuppressFocusEvent = (event) => {
+    if (!CFG.smartBlur) return false;
+    const t = event && event.type;
+    if (t !== 'blur' && t !== 'focusout') return false;
+
+    // Прямой blur/focusout на window или document — окно потеряло фокус
+    if (isWindowOrDoc(event.target)) return true;
+
+    // Переход фокуса МЕЖДУ элементами страницы при активном окне — не трогаем
+    // (работают дропдауны, валидация инпутов и т.д.)
+    if (t === 'focusout' && event.relatedTarget && !isWindowOrDoc(event.relatedTarget)) {
+      return !realHasFocus() ? true : false;
+    }
+
+    // Элементный blur/focusout без relatedTarget: глушим только если окно
+    // действительно потеряло фокус (нативный hasFocus), иначе это внутренняя логика страницы
+    return !realHasFocus();
+  };
+
+  const shouldSuppressFocusGainEvent = (event) => {
+    if (!CFG.smartBlur || !CFG.suppressWindowFocus) return false;
+    const t = event && event.type;
+    if (t !== 'focus' && t !== 'focusin') return false;
+    // Глушим только фокус самого окна/документа (возврат фокуса). Элементные
+    // focus/focusin (клики по инпутам) проходят свободно.
+    return isWindowOrDoc(event.target);
+  };
+
+  const shouldSuppressMouseEvent = (event) => {
+    if (!CFG.mouseLeave) return false;
+    const t = event && event.type;
+    if (t !== 'mouseleave' && t !== 'mouseout') return false;
+
+    // Интересуют только уходы курсора ИЗ окна (relatedTarget отсутствует).
+    // Переходы между элементами внутри страницы не глушим (v2 ломала hover у краёв окна).
+    const leftWindow = !event.relatedTarget || isWindowOrDoc(event.relatedTarget);
+    if (!leftWindow) return false;
+
+    if (isWindowOrDoc(event.target)) return true;
+
+    // Курсор ушёл с элемента у края окна наружу
+    const x = event.clientX;
+    const y = event.clientY;
+    if (typeof x === 'number' && typeof y === 'number') {
+      const w = window.innerWidth || screen.width;
+      const h = window.innerHeight || screen.height;
+      if (x <= 1 || y <= 1 || x >= w - 1 || y >= h - 1) {
+        return true;
+      }
+    }
+    return false;
+  };
+
+  const shouldSuppress = (event) => {
+    if (!event) return false;
+    if (syntheticPass > 0) return false; // Пропуск наших синтетических событий
+    if (CFG.trustOnly && event.isTrusted === false) return false; // self-test'ы страницы проходят и видят согласованное состояние
+
+    const t = event.type;
+    if (!t) return false;
+
+    // 1. Полноэкранный режим: глушим событие выхода, пока сессия активна
+    if (FS_EVENTS.has(t)) {
+      return isSpoofActive() && !realFullscreenElement();
+    }
+    if (VIDEO_FS_EVENTS.has(t)) {
+      return isSpoofActive() && !realFullscreenElement();
+    }
+
+    // 2. Pointer lock
+    if (PL_EVENTS.has(t)) {
+      return !!fakePointerLockEl && !realPointerLockElement();
+    }
+
+    // 3. Клавиатура (Esc, F11, Alt)
+    if (KEY_EVENTS.has(t)) {
+      return shouldSuppressKeyEvent(event);
+    }
+
+    // 4. Видимость вкладки и жизненный цикл страницы
+    if (CFG.visibility && (VIS_EVENTS.has(t) || LIFECYCLE_EVENTS.has(t))) {
+      return true;
+    }
+
+    // 5. Умный blur (защита от детекта смены окна без поломки дропдаунов)
+    if (FOCUS_EVENTS.has(t)) {
+      return shouldSuppressFocusEvent(event);
+    }
+
+    // 5b. Возврат фокуса в окно (парный к blur — страница не должна видеть "вернулся")
+    if (FOCUS_GAIN_EVENTS.has(t)) {
+      return shouldSuppressFocusGainEvent(event);
+    }
+
+    // 6. Уход курсора мыши
+    if (MOUSE_LEAVE_EVENTS.has(t)) {
+      return shouldSuppressMouseEvent(event);
+    }
+
+    // 7. Resize во время активной сессии
+    if (t === 'resize') {
+      if (CFG.suppressAllResizeInFake && isSpoofActive()) return true;
+      if (CFG.resizeAfterExit && (Date.now() - lastRealExit < CFG.resizeWindowMs)) return true;
+    }
+
+    return false;
+  };
+
+  // Top-level capture глушение: останавливает событие ДО того, как оно дойдет до слушателей страницы
+  const captureSuppressor = (event) => {
+    if (shouldSuppress(event)) {
+      suppressedCount++;
+      dbg('capture suppressed', event && event.type);
+      try {
+        event.stopImmediatePropagation();
+        event.stopPropagation();
+        if (event.cancelable) event.preventDefault();
+      } catch (_) {}
+    }
+  };
+
+  const ALL_CAPTURED_EVENTS = [
+    ...FS_EVENTS, ...PL_EVENTS, ...VIDEO_FS_EVENTS, ...VIS_EVENTS, ...LIFECYCLE_EVENTS,
+    'blur', 'focusout', 'focus', 'focusin', ...MOUSE_LEAVE_EVENTS, 'resize'
+  ];
+
+  ALL_CAPTURED_EVENTS.forEach((type) => {
+    try { nativeAdd.call(window, type, captureSuppressor, true); } catch (_) {}
+    try { nativeAdd.call(document, type, captureSuppressor, true); } catch (_) {}
+  });
+
+  // Защита от детекта CSP-нарушений (когда античит слушает securitypolicyviolation)
+  if (CFG.shieldCspViolations) {
+    const suppressCsp = (e) => {
+      try {
+        if (e && (e.blockedURI && (e.blockedURI.startsWith('blob:') || e.blockedURI.startsWith('data:')))) {
+          e.stopImmediatePropagation();
+          e.stopPropagation();
+        }
+      } catch (_) {}
+    };
+    try { nativeAdd.call(window, 'securitypolicyviolation', suppressCsp, true); } catch (_) {}
+    try { nativeAdd.call(document, 'securitypolicyviolation', suppressCsp, true); } catch (_) {}
+  }
+
+  // Обёртка на слушателя
+  const wrappedGeneric = new WeakMap();
+  const genericWrap = (listener) => {
+    let w = wrappedGeneric.get(listener);
+    if (w) return w;
+    const isFn = typeof listener === 'function';
+    w = function (event) {
+      if (shouldSuppress(event)) {
+        suppressedCount++;
+        dbg('wrapped listener suppressed', event && event.type);
+        return;
+      }
+      return isFn ? listener.call(this, event) : listener.handleEvent(event);
+    };
+    try {
+      if (isFn && listener.name) Object.defineProperty(w, 'name', { value: listener.name, configurable: true });
+    } catch (_) {}
+    wrappedGeneric.set(listener, w);
+    return w;
+  };
+
+  /* ==================== 6. MATCHMEDIA И СОВРЕМЕННЫЙ RANGE СИНТАКСИС ==================== */
+  const parseLength = (raw, isWidth, w, h) => {
+    const m = /^(-?[\d.]+)(px|rem|em|vw|vh|vmin|vmax|dvw|svw|lvw|dvh|svh|lvh)?$/i.exec(String(raw).trim());
+    if (!m) return null;
+    let val = parseFloat(m[1]);
+    const unit = (m[2] || 'px').toLowerCase();
+    if (unit === 'rem' || unit === 'em') val *= 16;
+    else if (unit === 'vw' || unit === 'dvw' || unit === 'svw' || unit === 'lvw') val = (val * w) / 100;
+    else if (unit === 'vh' || unit === 'dvh' || unit === 'svh' || unit === 'lvh') val = (val * h) / 100;
+    else if (unit === 'vmin') val = (val * Math.min(w, h)) / 100;
+    else if (unit === 'vmax') val = (val * Math.max(w, h)) / 100;
+    return val;
+  };
+
+  const evaluateMediaQuery = (query, w, h) => {
+    if (typeof query !== 'string' || !query.trim()) return null;
+
+    const evalPart = (part) => {
+      let m;
+      // Традиционный min/max: min-width: 1000px
+      if ((m = /^(min|max)-(width|height)\s*:\s*([^\s)]+)$/i.exec(part))) {
+        const isMin = m[1].toLowerCase() === 'min';
+        const isW = m[2].toLowerCase() === 'width';
+        const val = parseLength(m[3], isW, w, h);
+        if (val === null) return null;
+        const cur = isW ? w : h;
+        return isMin ? cur >= val : cur <= val;
+      }
+
+      // Традиционный точный: width: 1920px
+      if ((m = /^(width|height)\s*:\s*([^\s)]+)$/i.exec(part))) {
+        const isW = m[1].toLowerCase() === 'width';
+        const val = parseLength(m[2], isW, w, h);
+        if (val === null) return null;
+        return (isW ? w : h) === val;
+      }
+
+      // Современный CSS range: (width >= 1000px), (height <= 800px)
+      if ((m = /^(width|height)\s*(>=|<=|>|<|=)\s*([^\s)]+)$/i.exec(part))) {
+        const isW = m[1].toLowerCase() === 'width';
+        const op = m[2];
+        const val = parseLength(m[3], isW, w, h);
+        if (val === null) return null;
+        const cur = isW ? w : h;
+        if (op === '>=' || op === '=') return cur >= val;
+        if (op === '<=') return cur <= val;
+        if (op === '>') return cur > val;
+        if (op === '<') return cur < val;
+      }
+
+      // Современный двусторонний диапазон: (1000px <= width <= 2000px)
+      if ((m = /^([^\s)]+)\s*(<=|<)\s*(width|height)\s*(<=|<)\s*([^\s)]+)$/i.exec(part))) {
+        const isW = m[3].toLowerCase() === 'width';
+        const min = parseLength(m[1], isW, w, h);
+        const max = parseLength(m[5], isW, w, h);
+        if (min === null || max === null) return null;
+        const cur = isW ? w : h;
+        const minOk = m[2] === '<=' ? cur >= min : cur > min;
+        const maxOk = m[4] === '<=' ? cur <= max : cur < max;
+        return minOk && maxOk;
+      }
+
+      // display-mode: fullscreen
+      if ((m = /^display-mode\s*:\s*([\w-]+)$/i.exec(part))) {
+        return m[1].toLowerCase() === 'fullscreen';
+      }
+
+      // orientation: landscape / portrait
+      if ((m = /^orientation\s*:\s*(landscape|portrait)$/i.exec(part))) {
+        return (w >= h ? 'landscape' : 'portrait') === m[1].toLowerCase();
+      }
+
+      // aspect-ratio: 16/9
+      if ((m = /^aspect-ratio\s*:\s*([\d.]+)\s*\/\s*([\d.]+)$/i.exec(part))) {
+        const expected = parseFloat(m[1]) / parseFloat(m[2]);
+        return Math.abs((w / h) - expected) < 0.02;
+      }
+
+      return null;
+    };
+
+    let anyKnown = false;
+    let overall = false;
+
+    for (const altRaw of query.toLowerCase().split(',')) {
+      let altOk = true;
+      let altKnown = false;
+      for (let raw of altRaw.split(/\s+and\s+/)) {
+        let part = raw.trim().replace(/^only\s+/, '');
+        if (part === 'all' || part === 'screen' || part === '') continue;
+        part = part.replace(/^\(/, '').replace(/\)$/, '').trim();
+        if (!part) continue;
+        const r = evalPart(part);
+        if (r === null) return null;
+        altKnown = true;
+        if (!r) altOk = false;
+      }
+      if (altKnown) {
+        anyKnown = true;
+        if (altOk) overall = true;
+      }
+    }
+    return anyKnown ? overall : null;
+  };
+
+  const mqResult = (media) => {
+    if (!CFG.spoofMediaQueries || !isSpoofActive()) return null;
+    return evaluateMediaQuery(media, screen.width, screen.height);
+  };
+
+  const spoofedMqls = new WeakSet();
+  const installMqlOverride = (mql, query) => {
+    if (!mql || spoofedMqls.has(mql)) return;
+    const d = nativePropGetter(MediaQueryList.prototype, 'matches');
+    if (!d) return;
+    const getter = maskFn(makeGetter('matches', function () {
+      const fake = mqResult(query);
+      return fake === null ? d.call(this) : fake;
+    }), 'function get matches() { [native code] }');
+    try {
+      Object.defineProperty(mql, 'matches', { configurable: true, enumerable: true, get: getter });
+      spoofedMqls.add(mql);
+    } catch (_) {}
+  };
+
+  const wrapMqlChangeEvent = (event, mql) => {
+    const fake = mqResult(String(mql.media || ''));
+    if (fake === null) return event;
+    try {
+      return new Proxy(event, {
+        get(target, prop) {
+          if (prop === 'matches') return fake;
+          const value = target[prop];
+          return typeof value === 'function' ? value.bind(target) : value;
+        }
+      });
+    } catch (_) { return event; }
+  };
+
+  const mqlWrapped = new WeakMap();
+  const mqlWrap = (mql, listener) => {
+    let perMql = mqlWrapped.get(mql);
+    if (!perMql) { perMql = new WeakMap(); mqlWrapped.set(mql, perMql); }
+    let w = perMql.get(listener);
+    if (!w) {
+      const base = genericWrap(listener);
+      w = function (event) { return base.call(this, wrapMqlChangeEvent(event, mql)); };
+      perMql.set(listener, w);
+    }
+    return w;
+  };
+  const mqlUnwrap = (mql, listener) => {
+    const perMql = mqlWrapped.get(mql);
+    return perMql ? (perMql.get(listener) || listener) : listener;
+  };
+
+  /* ==================== 7. ПАТЧ ADDEVENTLISTENER / REMOVEEVENTLISTENER ==================== */
+  const isWatchedEvent = (type) => {
+    return FS_EVENTS.has(type) || PL_EVENTS.has(type) || VIDEO_FS_EVENTS.has(type)
+      || VIS_EVENTS.has(type) || LIFECYCLE_EVENTS.has(type) || FOCUS_EVENTS.has(type)
+      || FOCUS_GAIN_EVENTS.has(type) || KEY_EVENTS.has(type)
+      || MOUSE_LEAVE_EVENTS.has(type) || type === 'resize';
+  };
+
+  const patchedAdd = maskFn(makeMethod('addEventListener', function (type, listener, options) {
+    if (typeof type !== 'string' || listener == null
+        || (typeof listener !== 'function' && typeof listener !== 'object')) {
+      return nativeAdd.call(this, type, listener, options);
+    }
+
+    if (isWatchedEvent(type)) {
+      return nativeAdd.call(this, type, genericWrap(listener), options);
+    }
+
+    if (CFG.spoofMediaQueries && type === 'change'
+        && typeof MediaQueryList !== 'undefined' && this instanceof MediaQueryList) {
+      return nativeAdd.call(this, type, mqlWrap(this, listener), options);
+    }
+
+    return nativeAdd.call(this, type, listener, options);
+  }), 'function addEventListener() { [native code] }');
+  setFnMeta(patchedAdd, 'addEventListener', 2);
+  EventTarget.prototype.addEventListener = patchedAdd;
+
+  const patchedRemove = maskFn(makeMethod('removeEventListener', function (type, listener, options) {
+    let target = listener;
+    if (listener != null && (typeof listener === 'function' || typeof listener === 'object')) {
+      const g = wrappedGeneric.get(listener);
+      if (g) target = g;
+      const perMql = (typeof MediaQueryList !== 'undefined') && mqlWrapped.get(this);
+      if (perMql) {
+        const w = perMql.get(listener);
+        if (w) target = w;
+      }
+    }
+    return nativeRemove.call(this, type, target, options);
+  }), 'function removeEventListener() { [native code] }');
+  setFnMeta(patchedRemove, 'removeEventListener', 2);
+  EventTarget.prototype.removeEventListener = patchedRemove;
+
+  /* ==================== 8. УНИВЕРСАЛЬНОЕ ПЕРЕОПРЕДЕЛЕНИЕ СВОЙСТВ (OVERRIDE EVERYWHERE) ==================== */
+  // Надежно патчит свойство на объекте, прототипе и GlobalProxy
+  const overrideProp = (obj, prop, factory) => {
+    if (!obj) return false;
+    let d = null;
+    try { d = Object.getOwnPropertyDescriptor(obj, prop); } catch (_) {}
+    const nativeGet = d && typeof d.get === 'function' ? d.get : null;
+    const nativeSet = d && typeof d.set === 'function' ? d.set : undefined;
+
+    let body;
+    try { body = factory(nativeGet); } catch (_) { return false; }
+
+    const getter = maskFn(makeGetter(prop, body), `function get ${prop}() { [native code] }`);
+    try {
+      Object.defineProperty(obj, prop, {
+        configurable: true,
+        enumerable: d ? d.enumerable : true,
+        get: getter,
+        set: nativeSet
+      });
+      return true;
+    } catch (_) { return false; }
+  };
+
+  // Фикс v2: нативный геттер резолвится ОДИН раз (window || Window.prototype),
+  // иначе в Firefox own-свойство с nativeGet=null ломало значения вне спуф-режима.
+  const overrideEverywhere = (prop, factory) => {
+    let dWin = null, dProto = null;
+    try { dWin = Object.getOwnPropertyDescriptor(window, prop); } catch (_) {}
+    if (typeof Window !== 'undefined' && Window.prototype) {
+      try { dProto = Object.getOwnPropertyDescriptor(Window.prototype, prop); } catch (_) {}
+    }
+    const bestGet = (dWin && dWin.get) || (dProto && dProto.get) || null;
+    const bestSet = (dWin && dWin.set) || (dProto && dProto.set) || undefined;
+
+    if (!bestGet && !dWin && !dProto) return; // свойства нет — не изобретаем его
+
+    let body;
+    try { body = factory(bestGet); } catch (_) { return; }
+    const getter = maskFn(makeGetter(prop, body), `function get ${prop}() { [native code] }`);
+    const define = (obj, d) => {
+      if (!obj) return;
+      try {
+        Object.defineProperty(obj, prop, {
+          configurable: true,
+          enumerable: d ? d.enumerable : true,
+          get: getter,
+          set: bestSet
+        });
+      } catch (_) {}
+    };
+    if (dWin) define(window, dWin);          // Chrome: аксессоры лежат на инстансе window
+    if (typeof Window !== 'undefined' && Window.prototype) define(Window.prototype, dProto);
+  };
+
+  /* ---------- Fullscreen: Document & ShadowRoot ---------- */
+  if (CFG.fullscreen) {
+    const fsTargets = [Document.prototype];
+    if (typeof ShadowRoot !== 'undefined' && ShadowRoot.prototype) {
+      fsTargets.push(ShadowRoot.prototype);
+    }
+
+    fsTargets.forEach((proto) => {
+      [
+        'fullscreenElement', 'webkitFullscreenElement', 'currentFullscreenElement',
+        'webkitCurrentFullScreenElement', 'mozFullScreenElement', 'msFullscreenElement'
+      ].forEach((prop) => overrideProp(proto, prop, (nativeGet) => function () {
+        if (apiFsActive()) {
+          return fakeFullscreenEl || (this === document ? document.documentElement : (nativeGet ? nativeGet.call(this) : null));
+        }
+        return nativeGet ? nativeGet.call(this) : null;
+      }));
+    });
+
+    ['webkitIsFullScreen', 'mozFullScreen'].forEach((prop) =>
+      overrideProp(Document.prototype, prop, () => function () {
+        return apiFsActive();
+      })
+    );
+
+    ['fullscreenEnabled', 'webkitFullscreenEnabled', 'mozFullScreenEnabled'].forEach((prop) =>
+      overrideProp(Document.prototype, prop, () => function () { return true; })
+    );
+
+    overrideProp(Document.prototype, 'fullscreen', (nativeGet) => function () {
+      return apiFsActive() || (nativeGet ? !!nativeGet.call(this) : false);
+    });
+
+    overrideEverywhere('fullScreen', () => function () {
+      return apiFsActive();
+    });
+  }
+
+  /* ---------- Pointer Lock ---------- */
+  if (CFG.pointerLock) {
+    ['pointerLockElement', 'webkitPointerLockElement', 'mozPointerLockElement'].forEach((prop) =>
+      overrideProp(Document.prototype, prop, (nativeGet) => function () {
+        return fakePointerLockEl || (nativeGet ? nativeGet.call(this) : null);
+      })
+    );
+  }
+
+  /* ---------- Visibility & Page Lifecycle ---------- */
+  if (CFG.visibility) {
+    ['hidden', 'webkitHidden', 'mozHidden', 'msHidden'].forEach((prop) =>
+      overrideProp(Document.prototype, prop, () => function () { return false; })
+    );
+    ['visibilityState', 'webkitVisibilityState', 'mozVisibilityState', 'msVisibilityState'].forEach((prop) =>
+      overrideProp(Document.prototype, prop, () => function () { return 'visible'; })
+    );
+    overrideProp(Document.prototype, 'wasDiscarded', () => function () { return false; });
+    overrideProp(Document.prototype, 'prerendering', () => function () { return false; });
+  }
+
+  /* ---------- isTrusted для синтетических событий ---------- */
+  if (CFG.forgeIsTrusted) {
+    overrideProp(Event.prototype, 'isTrusted', (nativeGet) => function () {
+      return forgedEvents.has(this) || (nativeGet ? nativeGet.call(this) : false);
+    });
+  }
+
+  /* ---------- Document.hasFocus ---------- */
+  if (typeof Document.prototype.hasFocus === 'function') {
+    const nativeHasFocus = Document.prototype.hasFocus;
+    const patchedHasFocus = maskFn(makeMethod('hasFocus', function () {
+      if (CFG.alwaysHasFocus || isSpoofActive() || CFG.smartBlur) return true;
+      try { return nativeHasFocus.call(this); } catch (_) { return true; }
+    }), 'function hasFocus() { [native code] }');
+    setFnMeta(patchedHasFocus, 'hasFocus', 0);
+    Document.prototype.hasFocus = patchedHasFocus;
+  }
+
+  /* ---------- Screen Orientation API Lock Bypass ---------- */
+  if (typeof screen !== 'undefined' && screen.orientation) {
+    const OriProto = Object.getPrototypeOf(screen.orientation);
+    if (OriProto && typeof OriProto.lock === 'function') {
+      const patchedLock = maskFn(makeMethod('lock', function () {
+        dbg('screen.orientation.lock bypassed');
+        return Promise.resolve();
+      }), 'function lock() { [native code] }');
+      setFnMeta(patchedLock, 'lock', 1);
+      OriProto.lock = patchedLock;
+    }
+  }
+
+  /* ---------- Свойства панелей браузера (BarProp) ----------
+     В реальном fullscreen панели скрыты (.visible === false). В оконном режиме
+     visible === true — прямой детект эмуляции fullscreen. */
+  if (CFG.spoofBarProps) {
+    ['toolbar', 'menubar', 'locationbar', 'personalbar', 'scrollbars', 'statusbar'].forEach((name) => {
+      let bar = null;
+      try { bar = window[name]; } catch (_) {}
+      if (!bar) return;
+      const nativeVisible = nativePropGetter(Object.getPrototypeOf(bar), 'visible');
+      try {
+        Object.defineProperty(bar, 'visible', {
+          configurable: true,
+          enumerable: true,
+          get: maskFn(makeGetter('visible', function () {
+            return isSpoofActive() ? false : (nativeVisible ? nativeVisible.call(this) : true);
+          }), 'function get visible() { [native code] }')
+        });
+      } catch (_) {}
+    });
+  }
+
+  /* ---------- Мульти-мониторы ---------- */
+  if (CFG.spoofScreenExtended) {
+    if (ScreenProto) {
+      overrideProp(ScreenProto, 'isExtended', () => function () { return false; });
+    }
+    if (typeof window.getScreenDetails === 'function') {
+      const patchedGSD = maskFn(makeMethod('getScreenDetails', function () {
+        return Promise.reject(new DOMException('Permission denied.', 'NotAllowedError'));
+      }), 'function getScreenDetails() { [native code] }');
+      setFnMeta(patchedGSD, 'getScreenDetails', 0);
+      window.getScreenDetails = patchedGSD;
+    }
+  }
+
+  /* ---------- Keyboard Lock API ---------- */
+  if (CFG.bypassKeyboardLock && typeof navigator !== 'undefined' && navigator.keyboard) {
+    try {
+      const KP = Object.getPrototypeOf(navigator.keyboard);
+      if (KP && typeof KP.lock === 'function') {
+        const patchedKLock = maskFn(makeMethod('lock', function (keys) {
+          dbg('navigator.keyboard.lock bypassed');
+          return Promise.resolve(new Set(Array.isArray(keys) ? keys : []));
+        }), 'function lock() { [native code] }');
+        setFnMeta(patchedKLock, 'lock', 1);
+        KP.lock = patchedKLock;
+      }
+      if (KP && typeof KP.unlock === 'function') {
+        const patchedKUnlock = maskFn(makeMethod('unlock', function () {
+          dbg('navigator.keyboard.unlock bypassed');
+        }), 'function unlock() { [native code] }');
+        setFnMeta(patchedKUnlock, 'unlock', 0);
+        KP.unlock = patchedKUnlock;
+      }
+    } catch (_) {}
+  }
+
+  /* ---------- HTMLVideoElement webkit-fullscreen API (Safari-стиль плееры) ---------- */
+  if (CFG.videoFullscreenApi && typeof HTMLVideoElement !== 'undefined' && HTMLVideoElement.prototype) {
+    const VP = HTMLVideoElement.prototype;
+
+    overrideProp(VP, 'webkitSupportsFullscreen', () => function () { return true; });
+    overrideProp(VP, 'webkitDisplayingFullscreen', (nativeGet) => function () {
+      return apiFsActive() || (nativeGet ? !!nativeGet.call(this) : false);
+    });
+
+    const enterOrig = VP.webkitEnterFullscreen;
+    if (typeof enterOrig === 'function') {
+      const patchedVideoEnter = makeMethod('webkitEnterFullscreen', function (...args) {
+        activateSession(this);
+        let res;
+        try { res = enterOrig.apply(this, args); } catch (_) {}
+        queueMicrotask(() => dispatchForged(this, 'webkitbeginfullscreen'));
+        return res;
+      });
+      maskFn(patchedVideoEnter, 'function webkitEnterFullscreen() { [native code] }');
+      setFnMeta(patchedVideoEnter, 'webkitEnterFullscreen', 0);
+      VP.webkitEnterFullscreen = patchedVideoEnter;
+    }
+
+    const exitOrig = VP.webkitExitFullscreen;
+    if (typeof exitOrig === 'function') {
+      const patchedVideoExit = makeMethod('webkitExitFullscreen', function () {
+        if (CFG.blockExitFullscreen && isSpoofActive()) return undefined;
+        deactivateSession();
+        let res;
+        try { res = exitOrig.call(this); } catch (_) {}
+        queueMicrotask(() => dispatchForged(this, 'webkitendfullscreen'));
+        return res;
+      });
+      maskFn(patchedVideoExit, 'function webkitExitFullscreen() { [native code] }');
+      setFnMeta(patchedVideoExit, 'webkitExitFullscreen', 0);
+      VP.webkitExitFullscreen = patchedVideoExit;
+    }
+  }
+
+  /* ==================== 9. ON*-ОБРАБОТЧИКИ НА WINDOW, DOCUMENT И ELEMENT ==================== */
+  const sanitizeOnProps = (proto, names, guard) => {
+    if (!proto) return;
+    names.forEach((name) => {
+      let d;
+      try { d = Object.getOwnPropertyDescriptor(proto, name); } catch (_) { return; }
+      if (!d || typeof d.get !== 'function' || typeof d.set !== 'function') return;
+
+      try {
+        Object.defineProperty(proto, name, {
+          configurable: true,
+          enumerable: d.enumerable,
+          get() { return d.get.call(this); },
+          set(fn) {
+            if (typeof fn !== 'function') {
+              d.set.call(this, fn);
+              return;
+            }
+            const wrapped = function (event) {
+              if (guard && guard.call(this, event)) return;
+              if (shouldSuppress(event)) return;
+              return fn.call(this, event);
+            };
+            d.set.call(this, wrapped);
+          }
+        });
+      } catch (_) {}
+    });
+  };
+
+  if (CFG.fullscreen) {
+    const fsOnProps = [
+      'onfullscreenchange', 'onwebkitfullscreenchange', 'onmozfullscreenchange', 'onMSFullscreenChange',
+      'onfullscreenerror', 'onwebkitfullscreenerror', 'onmozfullscreenerror'
+    ];
+    sanitizeOnProps(Document.prototype, fsOnProps);
+    sanitizeOnProps(Window.prototype, fsOnProps);
+    if (typeof Element !== 'undefined') sanitizeOnProps(Element.prototype, fsOnProps);
+  }
+
+  if (CFG.pointerLock) {
+    const plProps = ['onpointerlockchange', 'onpointerlockerror'];
+    sanitizeOnProps(Document.prototype, plProps);
+    sanitizeOnProps(Element.prototype, plProps);
+  }
+
+  if (CFG.visibility) {
+    const visProps = ['onvisibilitychange', 'onwebkitvisibilitychange', 'onfreeze', 'onresume', 'onpagehide'];
+    sanitizeOnProps(Document.prototype, visProps);
+    sanitizeOnProps(Window.prototype, visProps);
+  }
+
+  if (CFG.smartBlur) {
+    sanitizeOnProps(Window.prototype, ['onblur', 'onfocusout', 'onfocus', 'onfocusin']);
+    sanitizeOnProps(Document.prototype, ['onblur', 'onfocusout', 'onfocus', 'onfocusin']);
+  }
+
+  if (CFG.mouseLeave) {
+    const mouseProps = ['onmouseleave', 'onmouseout', 'onpointerleave', 'onpointerout'];
+    sanitizeOnProps(Window.prototype, mouseProps);
+    sanitizeOnProps(Document.prototype, mouseProps);
+    if (typeof HTMLElement !== 'undefined') sanitizeOnProps(HTMLElement.prototype, mouseProps);
+  }
+
+  if (CFG.videoFullscreenApi && typeof HTMLVideoElement !== 'undefined') {
+    sanitizeOnProps(HTMLVideoElement.prototype, ['onwebkitbeginfullscreen', 'onwebkitendfullscreen']);
+  }
+
+  if (CFG.escapeKey || CFG.suppressF11 || CFG.suppressAltTabKeys) {
+    const keyProps = ['onkeydown', 'onkeyup', 'onkeypress'];
+    sanitizeOnProps(Document.prototype, keyProps);
+    sanitizeOnProps(Window.prototype, keyProps);
+    if (typeof HTMLElement !== 'undefined') sanitizeOnProps(HTMLElement.prototype, keyProps);
+  }
+
+  if (CFG.resizeAfterExit || CFG.suppressAllResizeInFake) {
+    sanitizeOnProps(Window.prototype, ['onresize']);
+  }
+
+  /* ==================== 10. ПЕРЕХВАТ ЗАПРОСОВ FULLSCREEN И POINTERLOCK ==================== */
+  const notifyFullscreenEntry = (target) => {
+    syntheticPass++;
+    try {
+      for (const type of ['fullscreenchange', 'webkitfullscreenchange']) {
+        for (const t of [target, document, window]) {
+          if (!t || typeof t.dispatchEvent !== 'function') continue;
+          try {
+            const e = new Event(type, { bubbles: true, cancelable: false });
+            forgedEvents.add(e);
+            t.dispatchEvent(e);
+          } catch (_) {}
+        }
+      }
+    } catch (_) {} finally { syntheticPass--; }
+    updateHud();
+  };
+
+  [
+    'requestFullscreen', 'webkitRequestFullscreen',
+    'webkitRequestFullScreen', 'mozRequestFullScreen', 'msRequestFullscreen'
+  ].forEach((name) => {
+    const orig = Element.prototype[name];
+    if (typeof orig !== 'function') return;
+
+    const patched = makeMethod(name, function (...args) {
+      const target = this || document.documentElement;
+      activateSession(target, 'api');
+      wasRealFs = false;
+
+      if (CFG.mockFullscreenRequest) {
+        dbg('mockFullscreenRequest active: emulating success without real fullscreen');
+        queueMicrotask(() => notifyFullscreenEntry(target));
+        showToast('Fullscreen: Эмулирован');
+        return Promise.resolve();
+      }
+
+      let result;
+      try {
+        result = orig.apply(this, args);
+      } catch (err) {
+        if (CFG.fallbackToFakeOnReject) {
+          dbg('native requestFullscreen threw error, falling back to fake:', err);
+          activateSession(target, 'api');
+          queueMicrotask(() => notifyFullscreenEntry(target));
+          showToast('Fullscreen: Эмулирован (fallback)');
+          return Promise.resolve();
+        }
+        throw err;
+      }
+
+      if (result && typeof result.then === 'function') {
+        return result.catch((err) => {
+          if (CFG.fallbackToFakeOnReject) {
+            dbg('native requestFullscreen rejected, falling back to fake:', err);
+            activateSession(target, 'api');
+            queueMicrotask(() => notifyFullscreenEntry(target));
+            showToast('Fullscreen: Эмулирован (fallback)');
+            return Promise.resolve();
+          }
+          deactivateSession();
+          return Promise.reject(err);
+        });
+      }
+
+      return result;
+    });
+
+    maskFn(patched, `function ${name}() { [native code] }`);
+    setFnMeta(patched, name, 0);
+    Element.prototype[name] = patched;
+  });
+
+  [
+    'requestPointerLock', 'webkitRequestPointerLock', 'mozRequestPointerLock'
+  ].forEach((name) => {
+    const orig = Element.prototype[name];
+    if (typeof orig !== 'function') return;
+
+    const patched = makeMethod(name, function (...args) {
+      fakePointerLockEl = this;
+      let res;
+      try {
+        res = orig.apply(this, args);
+      } catch (_) {
+        // Нативный вызов упал (нет жеста и т.п.) — эмулируем успешный захват
+        queueMicrotask(() => dispatchForged(document, 'pointerlockchange'));
+        return undefined;
+      }
+      if (res && typeof res.then === 'function') {
+        return res.catch(() => {
+          queueMicrotask(() => dispatchForged(document, 'pointerlockchange'));
+          return undefined;
+        });
+      }
+      return res;
+    });
+    maskFn(patched, `function ${name}() { [native code] }`);
+    setFnMeta(patched, name, 0);
+    Element.prototype[name] = patched;
+  });
+
+  ['exitFullscreen', 'webkitExitFullscreen', 'mozCancelFullScreen', 'msExitFullscreen']
+    .forEach((name) => {
+      const orig = Document.prototype[name];
+      if (typeof orig !== 'function') return;
+
+      const patched = makeMethod(name, function () {
+        if (CFG.blockExitFullscreen && isSpoofActive()) {
+          dbg('exitFullscreen called by page but blocked by CFG');
+          return Promise.resolve();
+        }
+        // Если страница сама выходит, но мы не блокируем полностью.
+        // В F11-режиме страницу API-fullscreen не занимал — сессию не роняем:
+        if (sessionMode === 'api') deactivateSession();
+        return orig ? orig.call(this) : Promise.resolve();
+      });
+      maskFn(patched, `function ${name}() { [native code] }`);
+      setFnMeta(patched, name, 0);
+      Document.prototype[name] = patched;
+    });
+
+  // Программный exitPointerLock от страницы должен отработать честно:
+  // чистим fake и присылаем синтетический pointerlockchange.
+  // Пользовательский Esc при этом по-прежнему скрыт (fake не трогаем).
+  ['exitPointerLock', 'webkitExitPointerLock', 'mozExitPointerLock'].forEach((name) => {
+    const orig = Document.prototype[name];
+    if (typeof orig !== 'function') return;
+
+    const patched = makeMethod(name, function () {
+      const hadFake = fakePointerLockEl;
+      fakePointerLockEl = null;
+      if (realPointerLockElement()) {
+        return orig.call(this);
+      }
+      if (hadFake) {
+        queueMicrotask(() => dispatchForged(document, 'pointerlockchange'));
+      }
+      return undefined;
+    });
+    maskFn(patched, `function ${name}() { [native code] }`);
+    setFnMeta(patched, name, 0);
+    Document.prototype[name] = patched;
+  });
+
+  /* ==================== 11. ГЕОМЕТРИЯ ОКНА И СВОЙСТВА (ПОДМЕНА ВЕЗДЕ) ==================== */
+  // Нативные геттеры вьюпорта ДО подмены (нужны для elementFromPoint-спуфинга)
+  const nDocCW = nativePropGetter(Element.prototype, 'clientWidth');
+  const nDocCH = nativePropGetter(Element.prototype, 'clientHeight');
+
+  if (CFG.spoofDimensions) {
+    // 1. innerWidth, innerHeight, outerWidth, outerHeight:
+    // Патчим везде: window, Window.prototype (см. фикс overrideEverywhere)
+    ['innerWidth', 'innerHeight', 'outerWidth', 'outerHeight'].forEach((prop) => {
+      const useWidth = prop.toLowerCase().includes('width');
+      overrideEverywhere(prop, (nativeGet) => function () {
+        if (isSpoofActive()) {
+          return useWidth ? screen.width : screen.height;
+        }
+        return nativeGet ? nativeGet.call(this) : (useWidth ? screen.width : screen.height);
+      });
+    });
+
+    // 2. screenX, screenY, screenLeft, screenTop (+ mozInnerScreenX/Y):
+    // Всегда 0 в полноэкранном режиме
+    ['screenX', 'screenY', 'screenLeft', 'screenTop', 'mozInnerScreenX', 'mozInnerScreenY'].forEach((prop) =>
+      overrideEverywhere(prop, (nativeGet) => function () {
+        if (isSpoofActive()) return 0;
+        return nativeGet ? nativeGet.call(this) : 0;
+      })
+    );
+
+    // 3. screen.avail*: avail == full, availLeft/Top == 0
+    if (ScreenProto) {
+      const fakeScreenSize = (isWidth, self) => {
+        const g = isWidth ? nScreen.width : nScreen.height;
+        return g ? g.call(self) : (isWidth ? screen.width : screen.height);
+      };
+      if (nScreen.availWidth) overrideProp(ScreenProto, 'availWidth', () => function () {
+        return isSpoofActive() ? fakeScreenSize(true, this) : nScreen.availWidth.call(this);
+      });
+      if (nScreen.availHeight) overrideProp(ScreenProto, 'availHeight', () => function () {
+        return isSpoofActive() ? fakeScreenSize(false, this) : nScreen.availHeight.call(this);
+      });
+      if (nScreen.availLeft) overrideProp(ScreenProto, 'availLeft', () => function () {
+        return isSpoofActive() ? 0 : nScreen.availLeft.call(this);
+      });
+      if (nScreen.availTop) overrideProp(ScreenProto, 'availTop', () => function () {
+        return isSpoofActive() ? 0 : nScreen.availTop.call(this);
+      });
+    }
+
+    // 4. visualViewport:
+    if (typeof window.VisualViewport === 'function' && VisualViewport.prototype) {
+      ['width', 'height'].forEach((prop) => overrideProp(VisualViewport.prototype, prop, (nativeGet) => function () {
+        if (isSpoofActive()) {
+          return prop === 'width' ? screen.width : screen.height;
+        }
+        return nativeGet ? nativeGet.call(this) : (prop === 'width' ? screen.width : screen.height);
+      }));
+      ['offsetLeft', 'offsetTop', 'pageLeft', 'pageTop'].forEach((prop) =>
+        overrideProp(VisualViewport.prototype, prop, (nativeGet) => function () {
+          if (isSpoofActive()) return 0;
+          return nativeGet ? nativeGet.call(this) : 0;
+        })
+      );
+      overrideProp(VisualViewport.prototype, 'scale', (nativeGet) => function () {
+        if (isSpoofActive()) return 1;
+        return nativeGet ? nativeGet.call(this) : 1;
+      });
+    }
+
+    // 5. getBoundingClientRect у html/body/fullscreen элемента:
+    // ВАЖНО: возвращает screen.width x screen.height КАК ПРИ РЕАЛЬНОМ, ТАК И ПРИ ФЕЙКОВОМ FULLSCREEN!
+    // Это исключает утечку высоты контента (например 1628px вместо 1080px).
+    const nativeRect = Element.prototype.getBoundingClientRect;
+    const patchedRect = maskFn(makeMethod('getBoundingClientRect', function () {
+      const real = nativeRect.call(this);
+      if (!isSpoofActive()) return real;
+      if (this !== document.documentElement && this !== document.body && this !== fakeFullscreenEl && this !== realFullscreenElement()) {
+        return real;
+      }
+      return buildRect(screen.width, screen.height);
+    }), 'function getBoundingClientRect() { [native code] }');
+    setFnMeta(patchedRect, 'getBoundingClientRect', 0);
+    Element.prototype.getBoundingClientRect = patchedRect;
+
+    // 6. getClientRects:
+    const nativeRects = Element.prototype.getClientRects;
+    if (typeof nativeRects === 'function') {
+      const patchedRects = maskFn(makeMethod('getClientRects', function () {
+        const real = nativeRects.apply(this, arguments);
+        if (!isSpoofActive()) return real;
+        if (this !== document.documentElement && this !== document.body && this !== fakeFullscreenEl && this !== realFullscreenElement()) {
+          return real;
+        }
+        try {
+          const list = [buildRect(screen.width, screen.height)];
+          list.item = (i) => list[i] || null;
+          Object.defineProperty(list, Symbol.toStringTag, { value: 'DOMRectList', configurable: true });
+          return list;
+        } catch (_) { return real; }
+      }), 'function getClientRects() { [native code] }');
+      setFnMeta(patchedRects, 'getClientRects', 0);
+      Element.prototype.getClientRects = patchedRects;
+    }
+
+    // 7. clientWidth / clientHeight:
+    ['clientWidth', 'clientHeight'].forEach((prop) => overrideProp(Element.prototype, prop, (nativeGet) => function () {
+      if (isSpoofActive()
+          && (this === document.documentElement || this === document.body || this === fakeFullscreenEl || this === realFullscreenElement())) {
+        return prop === 'clientWidth' ? screen.width : screen.height;
+      }
+      return nativeGet ? nativeGet.call(this) : (prop === 'clientWidth' ? screen.width : screen.height);
+    }));
+
+    // 8. offsetWidth / offsetHeight:
+    ['offsetWidth', 'offsetHeight'].forEach((prop) => overrideProp(HTMLElement.prototype, prop, (nativeGet) => function () {
+      if (isSpoofActive()
+          && (this === document.documentElement || this === document.body || this === fakeFullscreenEl || this === realFullscreenElement())) {
+        return prop === 'offsetWidth' ? screen.width : screen.height;
+      }
+      return nativeGet ? nativeGet.call(this) : (prop === 'offsetWidth' ? screen.width : screen.height);
+    }));
+
+    // 9. getComputedStyle:
+    if (typeof window.getComputedStyle === 'function') {
+      const nativeGCS = window.getComputedStyle.bind(window);
+      const patchedGCS = maskFn(makeMethod('getComputedStyle', function (el, pseudo) {
+        const cs = nativeGCS(el, pseudo);
+        if (!isSpoofActive() || !el) return cs;
+        if (el !== document.documentElement && el !== document.body && el !== fakeFullscreenEl) return cs;
+
+        const fakeValue = (name) => {
+          if (name === 'width') return screen.width + 'px';
+          if (name === 'height') return screen.height + 'px';
+          if (el === fakeFullscreenEl && el !== document.documentElement && el !== document.body) {
+            if (name === 'position') return 'fixed';
+            if (name === 'top') return '0px';
+            if (name === 'left') return '0px';
+            if (name === 'right') return '0px';
+            if (name === 'bottom') return '0px';
+          }
+          return null;
+        };
+
+        try {
+          return new Proxy(cs, {
+            get(target, prop) {
+              const direct = fakeValue(prop);
+              if (direct !== null) return direct;
+              if (prop === 'getPropertyValue') {
+                return (name) => fakeValue(name) !== null ? fakeValue(name) : target.getPropertyValue(name);
+              }
+              const value = target[prop];
+              return typeof value === 'function' ? value.bind(target) : value;
+            }
+          });
+        } catch (_) { return cs; }
+      }), 'function getComputedStyle() { [native code] }');
+      setFnMeta(patchedGCS, 'getComputedStyle', 2);
+      window.getComputedStyle = patchedGCS;
+    }
+  }
+
+  /* ---------- Хит-тестинг: elementFromPoint за пределами окна ----------
+     В реальном fullscreen документ покрывает весь экран — хит-тест в любой точке
+     экрана возвращает элемент. В оконном режиме точки вне окна дают null -> детект. */
+  if (CFG.spoofHitTesting) {
+    const beyondViewport = (x, y) => {
+      if (typeof x !== 'number' || typeof y !== 'number') return false;
+      if (x < 0 || y < 0 || x > screen.width || y > screen.height) return false;
+      try {
+        const vw = nDocCW ? nDocCW.call(document.documentElement) : screen.width;
+        const vh = nDocCH ? nDocCH.call(document.documentElement) : screen.height;
+        return x >= vw || y >= vh;
+      } catch (_) { return false; }
+    };
+    const fakeHit = () => document.fullscreenElement || document.documentElement;
+
+    const nativeEFP = Document.prototype.elementFromPoint;
+    if (typeof nativeEFP === 'function') {
+      const patchedEFP = maskFn(makeMethod('elementFromPoint', function (x, y) {
+        const res = nativeEFP.call(this, x, y);
+        if (!isSpoofActive() || res != null) return res;
+        return beyondViewport(x, y) ? fakeHit() : res;
+      }), 'function elementFromPoint() { [native code] }');
+      setFnMeta(patchedEFP, 'elementFromPoint', 2);
+      Document.prototype.elementFromPoint = patchedEFP;
+    }
+
+    const nativeEFPS = Document.prototype.elementsFromPoint;
+    if (typeof nativeEFPS === 'function') {
+      const patchedEFPS = maskFn(makeMethod('elementsFromPoint', function (x, y) {
+        const res = nativeEFPS.call(this, x, y);
+        if (!isSpoofActive() || (res && res.length)) return res;
+        return beyondViewport(x, y) ? [fakeHit()] : res;
+      }), 'function elementsFromPoint() { [native code] }');
+      setFnMeta(patchedEFPS, 'elementsFromPoint', 2);
+      Document.prototype.elementsFromPoint = patchedEFPS;
+    }
+  }
+
+  /* ---------- Scroll-метрики: лик контентной высоты и прокрутки ---------- */
+  if (CFG.spoofScrollMetrics) {
+    const isScrollRoot = (el) => el === document.documentElement || el === document.body
+      || el === fakeFullscreenEl || el === realFullscreenElement();
+
+    ['scrollHeight', 'scrollWidth'].forEach((prop) =>
+      overrideProp(Element.prototype, prop, (nativeGet) => function () {
+        if (isSpoofActive() && isScrollRoot(this)) {
+          return prop === 'scrollHeight' ? screen.height : screen.width;
+        }
+        return nativeGet ? nativeGet.call(this) : 0;
+      })
+    );
+
+    ['scrollLeft', 'scrollTop'].forEach((prop) =>
+      overrideProp(Element.prototype, prop, (nativeGet) => function () {
+        if (isSpoofActive() && isScrollRoot(this)) return 0;
+        return nativeGet ? nativeGet.call(this) : 0;
+      })
+    );
+
+    ['scrollX', 'scrollY', 'pageXOffset', 'pageYOffset', 'scrollMaxX', 'scrollMaxY'].forEach((prop) =>
+      overrideEverywhere(prop, (nativeGet) => function () {
+        if (isSpoofActive()) return 0;
+        return nativeGet ? nativeGet.call(this) : 0;
+      })
+    );
+  }
+
+  /* ==================== 12. MATCHMEDIA ==================== */
+  if (CFG.spoofMediaQueries && typeof window.matchMedia === 'function'
+      && typeof MediaQueryList !== 'undefined') {
+    const nativeMatchMedia = window.matchMedia.bind(window);
+    const patchedMatchMedia = maskFn(makeMethod('matchMedia', function (query) {
+      const mql = nativeMatchMedia(query);
+      try { installMqlOverride(mql, String(query)); } catch (_) {}
+      return mql;
+    }), 'function matchMedia() { [native code] }');
+    setFnMeta(patchedMatchMedia, 'matchMedia', 1);
+    window.matchMedia = patchedMatchMedia;
+
+    const MQLP = MediaQueryList.prototype;
+    const nativeAddL = typeof MQLP.addListener === 'function' ? MQLP.addListener : null;
+    if (nativeAddL) {
+      const patchedAddL = maskFn(makeMethod('addListener', function (listener) {
+        if (listener == null || (typeof listener !== 'function' && typeof listener !== 'object'))
+          return nativeAddL.call(this, listener);
+        return nativeAddL.call(this, mqlWrap(this, listener));
+      }), 'function addListener() { [native code] }');
+      setFnMeta(patchedAddL, 'addListener', 1);
+      MQLP.addListener = patchedAddL;
+    }
+    const nativeRemoveL = typeof MQLP.removeListener === 'function' ? MQLP.removeListener : null;
+    if (nativeRemoveL) {
+      const patchedRemoveL = maskFn(makeMethod('removeListener', function (listener) {
+        return nativeRemoveL.call(this, mqlUnwrap(this, listener));
+      }), 'function removeListener() { [native code] }');
+      setFnMeta(patchedRemoveL, 'removeListener', 1);
+      MQLP.removeListener = patchedRemoveL;
+    }
+  }
+
+  /* ==================== 13. ПСЕВДОКЛАСС :FULLSCREEN И SELECTORS ==================== */
+  if (CFG.spoofFullscreenSelector) {
+    const FS_PSEUDO = /:(-webkit-|-moz-|-ms-)?fullscreen\b/i;
+    const FS_PSEUDO_G = /:(-webkit-|-moz-|-ms-)?fullscreen\b/gi;
+    const FS_NEG = /:not\(\s*:(-webkit-|-moz-|-ms-)?fullscreen\s*\)/gi;
+    const stripFs = (sel) => sel.replace(FS_PSEUDO_G, '').replace(/\s+/g, ' ').trim();
+
+    const nativeMatches = Element.prototype.matches
+      || Element.prototype.webkitMatchesSelector
+      || Element.prototype.msMatchesSelector;
+
+    if (typeof nativeMatches === 'function') {
+      const patchedMatches = maskFn(makeMethod('matches', function (selector) {
+        if (typeof selector !== 'string' || !apiFsActive()) {
+          return nativeMatches.call(this, selector);
+        }
+
+        FS_NEG.lastIndex = 0;
+        if (FS_NEG.test(selector)) {
+          FS_NEG.lastIndex = 0;
+          if (this === fakeFullscreenEl || this === document.documentElement) return false;
+          const cleaned = selector.replace(FS_NEG, '').trim();
+          return nativeMatches.call(this, cleaned || ':root');
+        }
+
+        const nativeResult = nativeMatches.call(this, selector);
+        if (nativeResult) return true;
+        if (!FS_PSEUDO.test(selector)) return false;
+
+        const candidate = fakeFullscreenEl || document.documentElement;
+        const stripped = stripFs(selector);
+        const isCandidate = this === candidate || this === document.documentElement;
+
+        if (!stripped) return isCandidate;
+        try {
+          // Субъект селектора — сам fullscreen-элемент
+          if (isCandidate && nativeMatches.call(this, stripped)) return true;
+          // Составной селектор вида "div:fullscreen .child" — потомки fullscreen-элемента
+          if (candidate && this !== candidate
+              && typeof candidate.contains === 'function' && candidate.contains(this)
+              && nativeMatches.call(this, stripped)) return true;
+        } catch (_) {}
+        return false;
+      }), 'function matches() { [native code] }');
+      setFnMeta(patchedMatches, 'matches', 1);
+
+      Element.prototype.matches = patchedMatches;
+      if (Element.prototype.webkitMatchesSelector) Element.prototype.webkitMatchesSelector = patchedMatches;
+      if (Element.prototype.msMatchesSelector) Element.prototype.msMatchesSelector = patchedMatches;
+    }
+
+    const matchesFsSelector = (el, sel) => {
+      if (!el || typeof sel !== 'string') return false;
+      const stripped = stripFs(sel);
+      if (!stripped) return true;
+      try { return el.matches(stripped); } catch (_) { return false; }
+    };
+
+    ['Document', 'Element'].forEach((kind) => {
+      const proto = kind === 'Document' ? Document.prototype : Element.prototype;
+
+      const nativeQS = proto.querySelector;
+      if (typeof nativeQS === 'function') {
+        const patchedQS = maskFn(makeMethod('querySelector', function (selector) {
+          if (apiFsActive() && typeof selector === 'string' && FS_PSEUDO.test(selector)) {
+            const candidate = fakeFullscreenEl || document.documentElement;
+            if (candidate && (this === document || (typeof this.contains === 'function' && this.contains(candidate)))) {
+              if (matchesFsSelector(candidate, selector)) return candidate;
+            }
+          }
+          return nativeQS.call(this, selector);
+        }), 'function querySelector() { [native code] }');
+        setFnMeta(patchedQS, 'querySelector', 1);
+        proto.querySelector = patchedQS;
+      }
+
+      const nativeQSA = proto.querySelectorAll;
+      if (typeof nativeQSA === 'function') {
+        const patchedQSA = maskFn(makeMethod('querySelectorAll', function (selector) {
+          if (apiFsActive() && typeof selector === 'string' && FS_PSEUDO.test(selector)) {
+            const candidate = fakeFullscreenEl || document.documentElement;
+            const inScope = this === document || this === candidate
+              || (candidate && typeof this.contains === 'function' && this.contains(candidate));
+            if (!inScope) return nativeQSA.call(this, selector);
+
+            // :not(:fullscreen) — все элементы, кроме fullscreen-элемента
+            FS_NEG.lastIndex = 0;
+            if (FS_NEG.test(selector)) {
+              FS_NEG.lastIndex = 0;
+              const cleaned = selector.replace(FS_NEG, '').trim();
+              let base = null;
+              try { base = nativeQSA.call(this, cleaned || '*'); } catch (_) {}
+              if (!base) return makeNodeList([]);
+              const out = [];
+              const realFs = realFullscreenElement();
+              for (const el of base) {
+                if (el !== candidate && el !== realFs) out.push(el);
+              }
+              return makeNodeList(out);
+            }
+
+            // Субъект — сам fullscreen-элемент
+            if (candidate && matchesFsSelector(candidate, selector)) {
+              return makeNodeList([candidate]);
+            }
+
+            // Составные селекторы: "div:fullscreen .child" и т.п. — ищем остальную
+            // часть селектора и оставляем только элементы внутри fullscreen-элемента
+            const stripped = stripFs(selector);
+            if (stripped) {
+              try {
+                const res = nativeQSA.call(this, stripped);
+                const out = [];
+                for (const el of res) {
+                  if (el === candidate || (candidate && typeof candidate.contains === 'function' && candidate.contains(el))) {
+                    out.push(el);
+                  }
+                }
+                return makeNodeList(out);
+              } catch (_) {}
+            }
+            return makeNodeList([]);
+          }
+          return nativeQSA.call(this, selector);
+        }), 'function querySelectorAll() { [native code] }');
+        setFnMeta(patchedQSA, 'querySelectorAll', 1);
+        proto.querySelectorAll = patchedQSA;
+      }
+    });
+  }
+
+  /* ==================== 14. RESIZEOBSERVER (БЕЗ УТЕЧКИ РАЗМЕРОВ) ==================== */
+  if (typeof window.ResizeObserver === 'function') {
+    const NativeRO = window.ResizeObserver;
+
+    const patchEntry = (entry) => {
+      if (!entry) return entry;
+      const target = entry.target;
+      if (!isSpoofActive()) return entry;
+
+      // Если цель - документ, html, body или наш фуллскрин элемент:
+      const isRootTarget = !target || target === document || target === document.documentElement
+        || target === document.body || target === fakeFullscreenEl || target === realFullscreenElement();
+
+      if (!isRootTarget) return entry;
+
+      const w = screen.width;
+      const h = screen.height;
+      try {
+        const rect = buildRect(w, h);
+        const dpr = window.devicePixelRatio || 1;
+        const box = [{ inlineSize: w, blockSize: h }];
+        const dprBox = [{ inlineSize: Math.round(w * dpr), blockSize: Math.round(h * dpr) }];
+        return new Proxy(entry, {
+          get(t, p) {
+            if (p === 'contentRect') return rect;
+            if (p === 'borderBoxSize' || p === 'contentBoxSize') return box;
+            if (p === 'devicePixelContentBoxSize') return dprBox;
+            const v = t[p];
+            return typeof v === 'function' ? v.bind(t) : v;
+          }
+        });
+      } catch (_) { return entry; }
+    };
+
+    try {
+      const PatchedRO = class ResizeObserver extends NativeRO {
+        constructor(callback) {
+          if (typeof callback !== 'function') {
+            super(callback);
+            return;
+          }
+          super(function (entries, observer) {
+            if (isSpoofActive()) {
+              try { entries = entries.map(patchEntry); } catch (_) {}
+              return callback.call(this, entries, observer);
+            }
+            if (CFG.resizeAfterExit && (Date.now() - lastRealExit < CFG.resizeWindowMs)) {
+              suppressedCount++;
+              dbg('suppressed ResizeObserver callback during exit');
+              return;
+            }
+            return callback.call(this, entries, observer);
+          });
+        }
+      };
+      maskFn(PatchedRO, 'function ResizeObserver() { [native code] }');
+      window.ResizeObserver = PatchedRO;
+    } catch (_) {}
+  }
+
+  /* ==================== 15. ЗАЩИТА ОТ БЛОКИРОВКИ БУФЕРА ОБМЕНА И ВЫДЕЛЕНИЯ ==================== */
+  if (CFG.allowClipboard || CFG.allowContextMenu || CFG.allowSelection) {
+    const nativePreventDefault = Event.prototype.preventDefault;
+    Event.prototype.preventDefault = maskFn(makeMethod('preventDefault', function () {
+      const t = this.type;
+      if (CFG.allowClipboard && (t === 'copy' || t === 'cut' || t === 'paste')) {
+        dbg('unblocked clipboard event:', t);
+        return;
+      }
+      if (CFG.allowContextMenu && t === 'contextmenu') {
+        dbg('unblocked contextmenu');
+        return;
+      }
+      if (CFG.allowSelection && (t === 'selectstart' || t === 'dragstart')) {
+        dbg('unblocked selection event:', t);
+        return;
+      }
+      return nativePreventDefault.call(this);
+    }), 'function preventDefault() { [native code] }');
+    setFnMeta(Event.prototype.preventDefault, 'preventDefault', 0);
+
+    const injectSelectionStyle = () => {
+      try {
+        if (!document.documentElement) return;
+        const styleId = '__fse_unblock_selection_style';
+        if (document.getElementById(styleId)) return;
+        const style = document.createElement('style');
+        style.id = styleId;
+        style.textContent = `
+          *, *::before, *::after {
+            -webkit-user-select: auto !important;
+            -moz-user-select: auto !important;
+            -ms-user-select: auto !important;
+            user-select: auto !important;
+          }
+        `;
+        (document.head || document.documentElement).appendChild(style);
+      } catch (_) {}
+    };
+    if (document.head || document.documentElement) injectSelectionStyle();
+    else nativeAdd.call(document, 'DOMContentLoaded', injectSelectionStyle, { once: true });
+  }
+
+  /* ==================== 16. RAF KEEP-ALIVE ==================== */
+  if (CFG.keepRaf && typeof window.requestAnimationFrame === 'function' && typeof Worker !== 'undefined') {
+    const nativeRAF = window.requestAnimationFrame.bind(window);
+    const nativeCARAF = window.cancelAnimationFrame.bind(window);
+    const rafQueue = new Map();
+    let rafId = 1;
+    let fakeTime = performance.now();
+    let heartbeat = null;
+
+    const flush = () => {
+      if (!rafQueue.size) return;
+      const now = performance.now();
+      for (const id of Array.from(rafQueue.keys())) {
+        const cb = rafQueue.get(id);
+        if (!cb) continue;
+        rafQueue.delete(id);
+        try { cb(now); } catch (_) {}
+      }
+    };
+
+    const pump = () => {
+      if (!rafQueue.size) return;
+      if (!realHidden()) { flush(); return; }
+      fakeTime += 1000 / 60;
+      for (const id of Array.from(rafQueue.keys())) {
+        const cb = rafQueue.get(id);
+        if (!cb) continue;
+        rafQueue.delete(id);
+        try { cb(fakeTime); } catch (_) {}
+      }
+    };
+
+    const ensureHeartbeat = () => {
+      if (heartbeat) return heartbeat;
+      if (heartbeat === false) return null;
+      try {
+        const src = 'setInterval(function(){postMessage(0)},16)';
+        const url = URL.createObjectURL(new Blob([src], { type: 'text/javascript' }));
+        heartbeat = new Worker(url);
+        URL.revokeObjectURL(url);
+        heartbeat.onmessage = pump;
+      } catch (_) {
+        heartbeat = false;
+      }
+      return heartbeat;
+    };
+
+    // Подписка через visHooks (регистрируется ДО suppressor — фикс v2)
+    visHooks.push((hidden) => {
+      if (hidden) ensureHeartbeat();
+      else flush();
+    });
+
+    const patchedRAF = maskFn(makeMethod('requestAnimationFrame', function (cb) {
+      if (typeof cb !== 'function' || !realHidden()) return nativeRAF(cb);
+      ensureHeartbeat();
+      const id = rafId++;
+      rafQueue.set(id, cb);
+      return id;
+    }), 'function requestAnimationFrame() { [native code] }');
+    setFnMeta(patchedRAF, 'requestAnimationFrame', 1);
+    window.requestAnimationFrame = patchedRAF;
+
+    const patchedCARAF = maskFn(makeMethod('cancelAnimationFrame', function (id) {
+      if (rafQueue.delete(id)) return;
+      return nativeCARAF(id);
+    }), 'function cancelAnimationFrame() { [native code] }');
+    setFnMeta(patchedCARAF, 'cancelAnimationFrame', 1);
+    window.cancelAnimationFrame = patchedCARAF;
+  }
+
+  /* ==================== 16b. NORMALIZE TIMERS (АНТИ-ТРОТТЛИНГ СКРЫТОЙ ВКЛАДКИ) ====================
+     Прокторинг-скрипты меряют дельты setInterval: в скрытой вкладке Chrome троттлит
+     таймеры до 1с (а после 5 минут — до 1 раза в минуту), и дельта палит Alt+Tab.
+     Пока вкладка реально скрыта, все управляемые setTimeout/setInterval едут через
+     Worker, который не троттлится. На видимой вкладке — нативный путь.           */
+  let workerTimerSupport = null; // every(ms, fn) -> stopFn через worker (для idle/IO keep-alive)
+  let timersNormalized = false;
+  if (CFG.normalizeTimers && typeof Worker !== 'undefined' && typeof window.setTimeout === 'function') {
+    const nativeST = window.setTimeout;
+    const nativeSI = window.setInterval;
+    const nativeCT = window.clearTimeout;
+    const nativeCI = window.clearInterval;
+
+    let timerWorker = null;
+    try {
+      const src = [
+        'let m=new Map();',
+        'onmessage=function(e){var d=e.data;if(!d)return;var r=m.get(d.id);',
+        'if(d.cmd==="s"){if(d.iv){m.set(d.id,setInterval(function(){postMessage(d.id)},d.ms));}',
+        'else{m.set(d.id,setTimeout(function(){postMessage(d.id);m.delete(d.id)},d.ms));}}',
+        'else if(d.cmd==="c"&&r){clearTimeout(r);clearInterval(r);m.delete(d.id);}};'
+      ].join('');
+      const url = URL.createObjectURL(new Blob([src], { type: 'text/javascript' }));
+      timerWorker = new Worker(url);
+      URL.revokeObjectURL(url);
+    } catch (_) { timerWorker = null; }
+
+    if (timerWorker) {
+      timersNormalized = true;
+      const recs = new Map(); // id -> {cb, ms, iv, args, due, mode, nativeId}
+      let seq = 0;
+
+      const fire = (rec) => {
+        try { rec.cb(...rec.args); } catch (_) {}
+      };
+
+      // Подписки-интервалы для других подсистем (idle callbacks, IntersectionObserver)
+      const workerSubs = new Map();
+      let subSeq = 0;
+      workerTimerSupport = {
+        every(ms, fn) {
+          const id = 'sub:' + (++subSeq);
+          workerSubs.set(id, fn);
+          timerWorker.postMessage({ cmd: 's', id, ms, iv: true });
+          return () => { workerSubs.delete(id); timerWorker.postMessage({ cmd: 'c', id }); };
+        }
+      };
+
+      timerWorker.onmessage = (e) => {
+        const sub = workerSubs.get(e.data);
+        if (sub) { try { sub(); } catch (_) {} return; }
+        const rec = recs.get(e.data);
+        if (!rec) return;
+        if (rec.iv) { fire(rec); return; }
+        recs.delete(e.data);
+        fire(rec);
+      };
+
+      const startNative = (rec) => {
+        rec.mode = 'native';
+        const delay = rec.iv ? rec.ms : Math.max(0, rec.due - Date.now());
+        rec.nativeId = rec.iv
+          ? nativeSI.call(window, () => fire(rec), delay)
+          : nativeST.call(window, () => fire(rec), delay);
+      };
+      const startWorker = (rec) => {
+        rec.mode = 'worker';
+        const delay = rec.iv ? rec.ms : Math.max(0, rec.due - Date.now());
+        timerWorker.postMessage({ cmd: 's', id: rec.id, ms: delay, iv: !!rec.iv });
+      };
+
+      const stopRec = (rec) => {
+        if (rec.mode === 'worker') timerWorker.postMessage({ cmd: 'c', id: rec.id });
+        else {
+          nativeCT.call(window, rec.nativeId);
+          nativeCI.call(window, rec.nativeId);
+        }
+      };
+
+      // Миграция таймеров при смене реальной видимости (подписка ДО suppressor)
+      visHooks.push((hidden) => {
+        for (const rec of Array.from(recs.values())) {
+          if (hidden && rec.mode === 'native') {
+            stopRec(rec);
+            startWorker(rec);
+          } else if (!hidden && rec.mode === 'worker') {
+            stopRec(rec);
+            startNative(rec);
+          }
+        }
+      });
+
+      const patchedST = maskFn(makeMethod('setTimeout', function (cb, delay, ...args) {
+        if (typeof cb !== 'function') return nativeST.call(window, cb, delay, ...args);
+        const ms = Math.max(0, Number(delay) || 0);
+        if (ms > 2147483646) return nativeST.call(window, cb, delay, ...args);
+        const rec = { cb, ms, iv: false, args, due: Date.now() + ms, id: ++seq };
+        recs.set(rec.id, rec);
+        if (realHidden()) startWorker(rec); else startNative(rec);
+        return rec.id;
+      }), 'function setTimeout() { [native code] }');
+      setFnMeta(patchedST, 'setTimeout', 1);
+      window.setTimeout = patchedST;
+
+      const patchedSI = maskFn(makeMethod('setInterval', function (cb, delay, ...args) {
+        if (typeof cb !== 'function') return nativeSI.call(window, cb, delay, ...args);
+        const ms = Math.max(0, Number(delay) || 0);
+        if (ms > 2147483646) return nativeSI.call(window, cb, delay, ...args);
+        const rec = { cb, ms, iv: true, args, due: Date.now() + ms, id: ++seq };
+        recs.set(rec.id, rec);
+        if (realHidden()) startWorker(rec); else startNative(rec);
+        return rec.id;
+      }), 'function setInterval() { [native code] }');
+      setFnMeta(patchedSI, 'setInterval', 1);
+      window.setInterval = patchedSI;
+
+      const clearManaged = (id, nativeClear) => {
+        const rec = recs.get(id);
+        if (!rec) return false;
+        recs.delete(id);
+        stopRec(rec);
+        return true;
+      };
+
+      const patchedCT = maskFn(makeMethod('clearTimeout', function (id) {
+        if (!clearManaged(id, nativeCT)) return nativeCT.call(window, id);
+      }), 'function clearTimeout() { [native code] }');
+      setFnMeta(patchedCT, 'clearTimeout', 1);
+      window.clearTimeout = patchedCT;
+
+      const patchedCI = maskFn(makeMethod('clearInterval', function (id) {
+        if (!clearManaged(id, nativeCI)) return nativeCI.call(window, id);
+      }), 'function clearInterval() { [native code] }');
+      setFnMeta(patchedCI, 'clearInterval', 1);
+      window.clearInterval = patchedCI;
+    }
+  }
+
+  /* ==================== 16c. REQUESTIDLECALLBACK В СКРЫТОЙ ВКЛАДКЕ ====================
+     rIC привязан к рендерингу: в скрытой вкладке колбэки перестают приходить совсем.
+     Проктор может мерять "тишину" rIC как признак фоновой вкладки. Пока вкладка
+     реально скрыта — доставляем колбэки по worker-таймеру с правдоподобным deadline. */
+  if (CFG.spoofIdleCallback && CFG.visibility && typeof window.requestIdleCallback === 'function') {
+    const nativeRIC = window.requestIdleCallback.bind(window);
+    const nativeCIC = window.cancelIdleCallback.bind(window);
+    const idleRecs = new Map(); // id -> {cb, timeout, start, due, mode, nativeId}
+    let idleSeq = 0;
+    let idleStop = null;
+
+    const pumpIdle = () => {
+      const now = Date.now();
+      for (const [id, rec] of Array.from(idleRecs)) {
+        if (rec.mode !== 'worker') continue;
+        if (now >= rec.due) {
+          idleRecs.delete(id);
+          try {
+            rec.cb({
+              didTimeout: !!rec.timeout && now >= rec.start + rec.timeout,
+              timeRemaining: () => 50
+            });
+          } catch (_) {}
+        }
+      }
+      if (!idleRecs.size && idleStop) { idleStop(); idleStop = null; }
+    };
+    const ensureIdlePump = () => {
+      if (!idleStop && workerTimerSupport) idleStop = workerTimerSupport.every(250, pumpIdle);
+    };
+
+    const scheduleNative = (rec) => {
+      rec.mode = 'native';
+      rec.nativeId = nativeRIC((dl) => {
+        if (idleRecs.get(rec.id) === rec) idleRecs.delete(rec.id);
+        rec.cb(dl);
+      }, rec.timeout ? { timeout: rec.timeout } : undefined);
+    };
+
+    visHooks.push((hidden) => {
+      if (hidden) {
+        if (!workerTimerSupport) return;
+        for (const rec of idleRecs.values()) {
+          if (rec.mode !== 'native') continue;
+          nativeCIC(rec.nativeId);
+          rec.mode = 'worker';
+          rec.due = Math.max(Date.now(), rec.start + Math.min(rec.timeout || 1500, 5000));
+        }
+        if (idleRecs.size) ensureIdlePump();
+      } else {
+        for (const rec of idleRecs.values()) {
+          if (rec.mode === 'worker') scheduleNative(rec);
+        }
+        if (idleStop) { idleStop(); idleStop = null; }
+      }
+    });
+
+    const patchedRIC = maskFn(makeMethod('requestIdleCallback', function (cb, options) {
+      if (typeof cb !== 'function' || !workerTimerSupport) return nativeRIC(cb, options);
+      const rec = {
+        cb,
+        timeout: options && typeof options.timeout === 'number' ? options.timeout : 0,
+        start: Date.now(),
+        due: 0,
+        mode: 'native',
+        nativeId: 0,
+        id: ++idleSeq
+      };
+      idleRecs.set(rec.id, rec);
+      if (realHidden()) {
+        rec.mode = 'worker';
+        rec.due = rec.start + Math.min(rec.timeout || 1500, 5000);
+        ensureIdlePump();
+      } else {
+        scheduleNative(rec);
+      }
+      return rec.id;
+    }), 'function requestIdleCallback() { [native code] }');
+    setFnMeta(patchedRIC, 'requestIdleCallback', 1);
+    window.requestIdleCallback = patchedRIC;
+
+    const patchedCIC = maskFn(makeMethod('cancelIdleCallback', function (id) {
+      const rec = idleRecs.get(id);
+      if (rec) {
+        idleRecs.delete(id);
+        if (rec.mode === 'native') nativeCIC(rec.nativeId);
+        return;
+      }
+      return nativeCIC(id);
+    }), 'function cancelIdleCallback() { [native code] }');
+    setFnMeta(patchedCIC, 'cancelIdleCallback', 1);
+    window.cancelIdleCallback = patchedCIC;
+  }
+
+  /* ==================== 16d. INTERSECTIONOBSERVER В СКРЫТОЙ ВКЛАДКЕ ====================
+     В скрытой вкладке рендеринг остановлен и IO перестает присылать колбэки —
+     детект "тишины". Пока вкладка скрыта, периодически повторно вызываем колбэк
+     с последними known-записями и свежим timestamp. */
+  if (CFG.spoofIntersectionObserver && CFG.visibility && typeof window.IntersectionObserver === 'function') {
+    const NativeIO = window.IntersectionObserver;
+    const ioMeta = new WeakMap(); // observer -> {cb, last}
+    const ioObservers = new Set();
+    let ioStop = null;
+
+    const pumpIO = () => {
+      if (!ioObservers.size) return;
+      const now = performance.now();
+      for (const obs of Array.from(ioObservers)) {
+        const meta = ioMeta.get(obs);
+        if (!meta || !meta.last || !meta.last.length) continue;
+        let proxied;
+        try {
+          proxied = meta.last.map((en) => new Proxy(en, {
+            get(t, p) {
+              if (p === 'time') return now;
+              const v = t[p];
+              return typeof v === 'function' ? v.bind(t) : v;
+            }
+          }));
+        } catch (_) { continue; }
+        try { meta.cb.call(obs, proxied, obs); } catch (_) {}
+      }
+    };
+
+    visHooks.push((hidden) => {
+      if (hidden) {
+        if (ioStop || !workerTimerSupport) return;
+        ioStop = workerTimerSupport.every(1000, pumpIO);
+      } else if (ioStop) {
+        ioStop(); ioStop = null;
+      }
+    });
+
+    try {
+      const PatchedIO = class IntersectionObserver extends NativeIO {
+        constructor(cb, opts) {
+          super(function (entries, obs) {
+            ioMeta.set(obs, { cb, last: entries });
+            ioObservers.add(obs);
+            return cb.call(obs, entries, obs);
+          }, opts);
+        }
+      };
+      maskFn(PatchedIO, 'function IntersectionObserver() { [native code] }');
+      window.IntersectionObserver = PatchedIO;
+
+      const nativeIODisconnect = NativeIO.prototype.disconnect;
+      if (typeof nativeIODisconnect === 'function') {
+        const patchedIODisconnect = maskFn(makeMethod('disconnect', function (...args) {
+          ioObservers.delete(this);
+          return nativeIODisconnect.apply(this, args);
+        }), 'function disconnect() { [native code] }');
+        setFnMeta(patchedIODisconnect, 'disconnect', 0);
+        NativeIO.prototype.disconnect = patchedIODisconnect;
+      }
+    } catch (_) {}
+  }
+
+  /* ==================== 17. ЗАЩИТА СОСЕДНИХ РИЛМОВ (IFRAMES) ==================== */
+  if (CFG.protectRealms && CFG.maskNative) {
+    const sanitized = new WeakSet();
+
+    const sanitizeRealm = (win) => {
+      try {
+        if (!win || sanitized.has(win)) return;
+        sanitized.add(win);
+
+        const FP = win.Function && win.Function.prototype;
+        if (FP && FP.toString !== patchedToString) {
+          const realmNativeToString = FP.toString;
+          const realmToString = makeMethod('toString', function () {
+            const fake = maskedSources.get(this);
+            return fake !== undefined ? fake : realmNativeToString.call(this);
+          });
+          setFnMeta(realmToString, 'toString', 0);
+          try {
+            Object.defineProperty(FP, 'toString', {
+              value: realmToString, writable: true, enumerable: false, configurable: true
+            });
+          } catch (_) { FP.toString = realmToString; }
+        }
+
+        const ET = win.EventTarget && win.EventTarget.prototype;
+        if (ET && ET.addEventListener !== patchedAdd) {
+          const iframeNativeAdd = ET.addEventListener;
+          const iframeNativeRemove = ET.removeEventListener;
+
+          const patchedIframeAdd = maskFn(makeMethod('addEventListener', function (type, listener, options) {
+            if (typeof type !== 'string' || listener == null
+                || (typeof listener !== 'function' && typeof listener !== 'object')) {
+              return iframeNativeAdd.call(this, type, listener, options);
+            }
+            if (isWatchedEvent(type)) {
+              return iframeNativeAdd.call(this, type, genericWrap(listener), options);
+            }
+            return iframeNativeAdd.call(this, type, listener, options);
+          }), 'function addEventListener() { [native code] }');
+          setFnMeta(patchedIframeAdd, 'addEventListener', 2);
+          ET.addEventListener = patchedIframeAdd;
+
+          if (iframeNativeRemove) {
+            const patchedIframeRemove = maskFn(makeMethod('removeEventListener', function (type, listener, options) {
+              let target = listener;
+              if (listener != null) {
+                const g = wrappedGeneric.get(listener);
+                if (g) target = g;
+              }
+              return iframeNativeRemove.call(this, type, target, options);
+            }), 'function removeEventListener() { [native code] }');
+            setFnMeta(patchedIframeRemove, 'removeEventListener', 2);
+            ET.removeEventListener = patchedIframeRemove;
+          }
+        }
+      } catch (_) {}
+    };
+
+    // Синхронный перехват через appendChild и insertBefore
+    const nativeAppendChild = Node.prototype.appendChild;
+    Node.prototype.appendChild = maskFn(makeMethod('appendChild', function (child) {
+      const result = nativeAppendChild.call(this, child);
+      try {
+        if (child && (child.tagName === 'IFRAME' || child.tagName === 'FRAME')) {
+          sanitizeRealm(child.contentWindow);
+        }
+      } catch (_) {}
+      return result;
+    }), 'function appendChild() { [native code] }');
+    setFnMeta(Node.prototype.appendChild, 'appendChild', 1);
+
+    const nativeInsertBefore = Node.prototype.insertBefore;
+    Node.prototype.insertBefore = maskFn(makeMethod('insertBefore', function (newNode, refNode) {
+      const result = nativeInsertBefore.call(this, newNode, refNode);
+      try {
+        if (newNode && (newNode.tagName === 'IFRAME' || newNode.tagName === 'FRAME')) {
+          sanitizeRealm(newNode.contentWindow);
+        }
+      } catch (_) {}
+      return result;
+    }), 'function insertBefore() { [native code] }');
+    setFnMeta(Node.prototype.insertBefore, 'insertBefore', 2);
+
+    const frameProtos = [
+      typeof HTMLIFrameElement !== 'undefined' && HTMLIFrameElement.prototype,
+      typeof HTMLFrameElement !== 'undefined' && HTMLFrameElement.prototype
+    ].filter(Boolean);
+
+    ['contentWindow', 'contentDocument'].forEach((prop) => {
+      frameProtos.forEach((proto) => {
+        overrideProp(proto, prop, (nativeGet) => function () {
+          const result = nativeGet ? nativeGet.call(this) : null;
+          try {
+            if (prop === 'contentWindow') sanitizeRealm(result);
+            else if (result && result.defaultView) sanitizeRealm(result.defaultView);
+          } catch (_) {}
+          return result;
+        });
+      });
+    });
+
+    try {
+      const mo = new MutationObserver((muts) => {
+        for (const m of muts) {
+          for (const node of m.addedNodes) {
+            if (node.nodeType !== 1) continue;
+            try {
+              if (node.tagName === 'IFRAME' || node.tagName === 'FRAME') {
+                sanitizeRealm(node.contentWindow);
+              }
+              if (typeof node.querySelectorAll === 'function') {
+                node.querySelectorAll('iframe,frame').forEach((f) => {
+                  try { sanitizeRealm(f.contentWindow); } catch (_) {}
+                });
+              }
+            } catch (_) {}
+          }
+        }
+      });
+      mo.observe(document, { childList: true, subtree: true });
+    } catch (_) {}
+  }
+
+  /* ==================== 18. ПОЛЬЗОВАТЕЛЬСКИЙ ИНТЕРФЕЙС И ГОРЯЧИЕ КЛАВИШИ ==================== */
+  const showToast = (message) => {
+    if (!isTopFrame) return; // никакого UI внутри iframe
+    try {
+      const id = '__fse_toast_notice';
+      let toast = document.getElementById(id);
+      if (!toast) {
+        toast = document.createElement('div');
+        toast.id = id;
+        toast.style.cssText = `
+          position: fixed;
+          top: 14px;
+          right: 14px;
+          background: rgba(18, 24, 38, 0.92);
+          color: #5ce1e6;
+          border: 1px solid rgba(92, 225, 230, 0.4);
+          padding: 8px 16px;
+          border-radius: 6px;
+          font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+          font-size: 13px;
+          font-weight: 500;
+          box-shadow: 0 4px 14px rgba(0,0,0,0.35);
+          z-index: 2147483647;
+          pointer-events: none;
+          transition: opacity 0.3s ease;
+          opacity: 0;
+        `;
+        (document.body || document.documentElement).appendChild(toast);
+      }
+      toast.textContent = `[FSE-Bypass] ${message}`;
+      toast.style.opacity = '1';
+      clearTimeout(toast._timer);
+      toast._timer = setTimeout(() => { toast.style.opacity = '0'; }, 2400);
+    } catch (_) {}
+  };
+
+  let hudEl = null;
+  const updateHud = () => {
+    if (!CFG.hudBadge || !hudEl) return;
+    hudEl.textContent = `FS: ${isSpoofActive() ? (sessionMode === 'f11' ? '🟢 F11' : '🟢 ON') : '⚪ OFF'} | BLUR: ${CFG.smartBlur ? '🟢' : '⚪'}`;
+  };
+
+  const initHud = () => {
+    if (!CFG.hudBadge || !isTopFrame) return;
+    try {
+      if (hudEl || !document.body) return;
+      hudEl = document.createElement('div');
+      hudEl.id = '__fse_hud_badge';
+      hudEl.title = 'Клик: переключить Fullscreen | Ctrl+Alt+F: переключить режим | Ctrl+Alt+B: Blur | Ctrl+Alt+H: скрыть бейдж';
+      hudEl.style.cssText = `
+        position: fixed;
+        bottom: 12px;
+        right: 12px;
+        background: rgba(15, 23, 42, 0.85);
+        color: #e2e8f0;
+        border: 1px solid rgba(148, 163, 184, 0.25);
+        padding: 5px 10px;
+        border-radius: 12px;
+        font-family: monospace;
+        font-size: 11px;
+        cursor: pointer;
+        z-index: 2147483646;
+        user-select: none;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+        backdrop-filter: blur(4px);
+      `;
+      hudEl.onclick = () => {
+        toggleFullscreenMode();
+      };
+      document.body.appendChild(hudEl);
+      updateHud();
+    } catch (_) {}
+  };
+
+  const toggleFullscreenMode = () => {
+    if (isSpoofActive()) {
+      deactivateSession();
+      showToast('Fullscreen: ВЫКЛ');
+    } else {
+      activateSession(document.documentElement);
+      notifyFullscreenEntry(document.documentElement);
+      showToast('Fullscreen: ЭМУЛЯЦИЯ ВКЛ');
+    }
+  };
+
+  const toggleBlurMode = () => {
+    CFG.smartBlur = !CFG.smartBlur;
+    showToast(`Smart Blur: ${CFG.smartBlur ? 'ВКЛ' : 'ВЫКЛ'}`);
+    updateHud();
+  };
+
+  const toggleHudVisibility = () => {
+    if (!hudEl) {
+      CFG.hudBadge = true;
+      initHud();
+      showToast('HUD бейдж: ВКЛ');
+    } else {
+      hudEl.style.display = hudEl.style.display === 'none' ? 'block' : 'none';
+      showToast(`HUD бейдж: ${hudEl.style.display === 'none' ? 'СКРЫТ' : 'ПОКАЗАН'}`);
+    }
+  };
+
+  if (CFG.hotkeys) {
+    nativeAdd.call(window, 'keydown', (e) => {
+      if (e.ctrlKey && e.altKey) {
+        if (e.code === 'KeyF' || e.key === 'f' || e.key === 'F' || e.key === 'а' || e.key === 'А') {
+          e.preventDefault();
+          e.stopImmediatePropagation();
+          toggleFullscreenMode();
+        } else if (e.code === 'KeyB' || e.key === 'b' || e.key === 'B' || e.key === 'и' || e.key === 'И') {
+          e.preventDefault();
+          e.stopImmediatePropagation();
+          toggleBlurMode();
+        } else if (e.code === 'KeyH' || e.key === 'h' || e.key === 'H' || e.key === 'р' || e.key === 'Р') {
+          e.preventDefault();
+          e.stopImmediatePropagation();
+          toggleHudVisibility();
+        }
+      }
+    }, true);
+  }
+
+  if (document.body) initHud();
+  else nativeAdd.call(document, 'DOMContentLoaded', initHud, { once: true });
+
+  /* ==================== 19. ПУБЛИЧНОЕ УПРАВЛЕНИЕ И ОТЛАДКА ==================== */
+  const api = {
+    version: '3.2.0',
+    cfg: CFG,
+    toggle: toggleFullscreenMode,
+    enable: () => {
+      activateSession(document.documentElement);
+      notifyFullscreenEntry(document.documentElement);
+      showToast('Fullscreen: ВКЛ');
+    },
+    disable: () => {
+      deactivateSession();
+      showToast('Fullscreen: ВЫКЛ');
+    },
+    toggleBlur: toggleBlurMode,
+    get isSessionActive() { return sessionActive; },
+    get isSpoofActive() { return isSpoofActive(); },
+    get fakeFullscreenElement() { return fakeFullscreenEl; },
+    get realFullscreenElement() { return realFullscreenElement(); },
+    get lastRealExit() { return lastRealExit; },
+    get suppressed() { return suppressedCount; },
+    status: () => ({
+      version: '3.2.0',
+      sessionActive,
+      isSpoofActive: isSpoofActive(),
+      realFullscreen: !!realFullscreenElement(),
+      fakeElement: fakeFullscreenEl,
+      smartBlur: CFG.smartBlur,
+      visibility: CFG.visibility,
+      timersNormalized,
+      isTopFrame,
+      suppressedCount
+    })
+  };
+  // API не enumerable: меньше шансов, что страница просканирует его перебором свойств window
+  try {
+    Object.defineProperty(window, '__fseBypass', { value: api, writable: true, enumerable: false, configurable: true });
+  } catch (_) { window.__fseBypass = api; }
+
+  dbg('v3.2.0 active on', location.href);
+})();
