@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Fullscreen Exit Bypass & Anti-Proctoring Suite
 // @namespace    local.userscripts.fullscreen
-// @version      3.2.0
+// @version      3.5.0
 // @description  Скрывает от страницы выход из полноэкранного режима, потерю фокуса, переключение вкладок, уход курсора и все сопутствующие каналы детекта прокторинга
 // @match        *://*/*
 // @match        file:///*
@@ -11,6 +11,34 @@
 // ==/UserScript==
 
 /*
+  Changelog v3.5.0 (Firefox-фикс):
+  - audioKeepAlive: беззвучный AudioContext (осциллятор gain=0). Firefox НЕ троттлит
+    таймеры вкладки, которая "воспроизводит звук" — TimeoutManager проверяет
+    IsPlayingAudio(), куда AudioContext в состоянии running входит независимо от
+    громкости. Это полностью отключает троттлинг скрытой вкладки, включая worker'ы
+    (Firefox троттлит worker-таймеры через тот же TimeoutManager, поэтому v3.4.0
+    на Firefox не спасала). resume() по первому жесту (autoplay-политика).
+  - Планировщик таймеров: на Gecko при играющем аудио остаёмся на нативных
+    таймерах (точнее worker'а); на Chromium и без аудио — прежняя worker-схема.
+  - status(): новое поле audioKeepAlive ('running' | 'suspended' | null).
+
+  Changelog v3.4.0:
+  - normalizeTimers переписан: единый планировщик с абсолютным rec.next. Фаза
+    таймеров теперь сохраняется при миграции native<->worker<->native (раньше
+    интервал перезапускался с нуля и при Alt+Tab давал два поздних тика подряд —
+    их и ловил детект "дрейф таймеров" / троттлинг фоновой вкладки).
+  - Выравнивание дельты: после опоздания >50мс следующий тик строго через ms —
+    страница видит ровные интервалы, аномалия не накапливается и не повторяется.
+  - Резервный бэкенд MessageChannel, если CSP сайта запрещает blob:-Worker
+    (worker-src/script-src): задачи порта не троттлятся как DOM-таймеры.
+  - status(): новое поле timersBackend ('worker' | 'messagechannel' | null).
+
+  Changelog v3.3.0:
+  - suppressMouseEnter: глушатся mouseenter/mouseover/pointerenter/pointerover при
+    ВОЗВРАТЕ курсора в окно извне (relatedTarget отсутствует, координаты у края).
+    Без этого страница видела "enter без leave" — несогласованность = детект.
+    Переходы между элементами страницы и тач/перо не затронуты.
+
   Changelog v3.2.0:
   - Поддержка браузерного F11-fullscreen: F11 не вызывает Fullscreen API и
     fullscreenchange, поэтому раньше подмена при выходе по F11 не включалась.
@@ -102,6 +130,7 @@
     // --- Мышь и курсор (Mouse / Pointer) ---
     pointerLock: true,                // сохранение fakePointerLockElement + корректный программный exitPointerLock
     mouseLeave: true,                 // глушить mouseleave / mouseout при выходе курсора за пределы окна/монитора
+    suppressMouseEnter: true,         // глушить mouseenter / mouseover при возврате курсора в окно (страница не видит пары "ушёл-вернулся")
 
     // --- Клавиатурные ловушки ---
     escapeKey: true,                  // глушить клавишу Escape пока страница в fullscreen
@@ -131,6 +160,7 @@
     forgeIsTrusted: true,             // синтетические события от скрипта получают isTrusted=true
     protectRealms: true,              // санитизация iframe/frame-контекстов (синхронно через appendChild и через getters)
     normalizeTimers: true,            // worker-таймеры в скрытой вкладке: нет троттлинга setTimeout/setInterval (анти дрейф-детект)
+    audioKeepAlive: true,             // беззвучный AudioContext: Firefox не троттлит вкладку "с играющим аудио" (IsPlayingAudio)
     spoofIdleCallback: true,          // requestIdleCallback не замирает в скрытой вкладке
     spoofIntersectionObserver: true,  // IntersectionObserver продолжает присылать колбэки в скрытой вкладке
     crossFrameSync: true,             // same-origin дочерние фреймы наследуют состояние сессии топ-фрейма
@@ -159,6 +189,7 @@
   const FOCUS_EVENTS = new Set(['blur', 'focusout']);
   const FOCUS_GAIN_EVENTS = new Set(['focus', 'focusin']);
   const MOUSE_LEAVE_EVENTS = new Set(['mouseleave', 'mouseout', 'pointerleave', 'pointerout']);
+  const MOUSE_ENTER_EVENTS = new Set(['mouseenter', 'mouseover', 'pointerenter', 'pointerover']);
   const KEY_EVENTS = new Set(['keydown', 'keyup', 'keypress']);
 
   const dbg = (...args) => { if (CFG.debug) console.debug('[fse-bypass]', ...args); };
@@ -526,6 +557,34 @@
     return false;
   };
 
+  const shouldSuppressMouseEnterEvent = (event) => {
+    if (!CFG.suppressMouseEnter) return false;
+    const t = event && event.type;
+    if (t !== 'mouseenter' && t !== 'mouseover' && t !== 'pointerenter' && t !== 'pointerover') return false;
+    // Тач/перо не трогаем: на них завязаны tap-меню
+    if ((t === 'pointerenter' || t === 'pointerover') && event.pointerType && event.pointerType !== 'mouse') {
+      return false;
+    }
+    // Интересует только возврат ИЗ-ЗА пределов окна (relatedTarget отсутствует
+    // или внешний). Переходы между элементами страницы работают как обычно.
+    const fromOutside = !event.relatedTarget || isWindowOrDoc(event.relatedTarget);
+    if (!fromOutside) return false;
+
+    if (isWindowOrDoc(event.target)) return true;
+
+    // Курсор вошёл в элемент у края окна снаружи
+    const x = event.clientX;
+    const y = event.clientY;
+    if (typeof x === 'number' && typeof y === 'number') {
+      const w = window.innerWidth || screen.width;
+      const h = window.innerHeight || screen.height;
+      if (x <= 1 || y <= 1 || x >= w - 1 || y >= h - 1) {
+        return true;
+      }
+    }
+    return false;
+  };
+
   const shouldSuppress = (event) => {
     if (!event) return false;
     if (syntheticPass > 0) return false; // Пропуск наших синтетических событий
@@ -572,6 +631,12 @@
       return shouldSuppressMouseEvent(event);
     }
 
+    // 6b. Возврат курсора в окно: без этого страница видит "enter без leave",
+    // что само по себе признак подмены
+    if (MOUSE_ENTER_EVENTS.has(t)) {
+      return shouldSuppressMouseEnterEvent(event);
+    }
+
     // 7. Resize во время активной сессии
     if (t === 'resize') {
       if (CFG.suppressAllResizeInFake && isSpoofActive()) return true;
@@ -596,7 +661,7 @@
 
   const ALL_CAPTURED_EVENTS = [
     ...FS_EVENTS, ...PL_EVENTS, ...VIDEO_FS_EVENTS, ...VIS_EVENTS, ...LIFECYCLE_EVENTS,
-    'blur', 'focusout', 'focus', 'focusin', ...MOUSE_LEAVE_EVENTS, 'resize'
+    'blur', 'focusout', 'focus', 'focusin', ...MOUSE_LEAVE_EVENTS, ...MOUSE_ENTER_EVENTS, 'resize'
   ];
 
   ALL_CAPTURED_EVENTS.forEach((type) => {
@@ -800,7 +865,7 @@
     return FS_EVENTS.has(type) || PL_EVENTS.has(type) || VIDEO_FS_EVENTS.has(type)
       || VIS_EVENTS.has(type) || LIFECYCLE_EVENTS.has(type) || FOCUS_EVENTS.has(type)
       || FOCUS_GAIN_EVENTS.has(type) || KEY_EVENTS.has(type)
-      || MOUSE_LEAVE_EVENTS.has(type) || type === 'resize';
+      || MOUSE_LEAVE_EVENTS.has(type) || MOUSE_ENTER_EVENTS.has(type) || type === 'resize';
   };
 
   const patchedAdd = maskFn(makeMethod('addEventListener', function (type, listener, options) {
@@ -1137,8 +1202,9 @@
     sanitizeOnProps(Document.prototype, ['onblur', 'onfocusout', 'onfocus', 'onfocusin']);
   }
 
-  if (CFG.mouseLeave) {
-    const mouseProps = ['onmouseleave', 'onmouseout', 'onpointerleave', 'onpointerout'];
+  if (CFG.mouseLeave || CFG.suppressMouseEnter) {
+    const mouseProps = ['onmouseleave', 'onmouseout', 'onpointerleave', 'onpointerout',
+      'onmouseenter', 'onmouseover', 'onpointerenter', 'onpointerover'];
     sanitizeOnProps(Window.prototype, mouseProps);
     sanitizeOnProps(Document.prototype, mouseProps);
     if (typeof HTMLElement !== 'undefined') sanitizeOnProps(HTMLElement.prototype, mouseProps);
@@ -1873,10 +1939,16 @@
      Прокторинг-скрипты меряют дельты setInterval: в скрытой вкладке Chrome троттлит
      таймеры до 1с (а после 5 минут — до 1 раза в минуту), и дельта палит Alt+Tab.
      Пока вкладка реально скрыта, все управляемые setTimeout/setInterval едут через
-     Worker, который не троттлится. На видимой вкладке — нативный путь.           */
+     Worker (не троттлится), при CSP-запрете blob:-Worker — через MessageChannel.
+     Планировщик хранит абсолютное время следующего тика (rec.next): миграция
+     между бэкендами не сбивает фазу, после опоздания дельта выравнивается в ms.
+     На видимой вкладке — нативный путь.                                           */
   let workerTimerSupport = null; // every(ms, fn) -> stopFn через worker (для idle/IO keep-alive)
   let timersNormalized = false;
-  if (CFG.normalizeTimers && typeof Worker !== 'undefined' && typeof window.setTimeout === 'function') {
+  let timersBackend = null;      // 'worker' | 'messagechannel' | null
+  let audioRunningFn = null;     // () => AudioContext играет (для gecko-исключения из троттлинга)
+  if (CFG.normalizeTimers && typeof window.setTimeout === 'function'
+      && (typeof Worker !== 'undefined' || typeof MessageChannel !== 'undefined')) {
     const nativeST = window.setTimeout;
     const nativeSI = window.setInterval;
     const nativeCT = window.clearTimeout;
@@ -1896,18 +1968,18 @@
       URL.revokeObjectURL(url);
     } catch (_) { timerWorker = null; }
 
+    const recs = new Map(); // id -> {cb, ms, iv, args, next, mode, handle}
+    let seq = 0;
+    let mcPort = null;      // резервный планировщик MessageChannel (без Worker)
+    let mcActive = false;
+
+    const fireCb = (rec) => { try { rec.cb(...rec.args); } catch (_) {} };
+
+    // Подписки-интервалы для других подсистем (idle callbacks, IntersectionObserver)
+    const workerSubs = new Map();
+    let subSeq = 0;
     if (timerWorker) {
-      timersNormalized = true;
-      const recs = new Map(); // id -> {cb, ms, iv, args, due, mode, nativeId}
-      let seq = 0;
-
-      const fire = (rec) => {
-        try { rec.cb(...rec.args); } catch (_) {}
-      };
-
-      // Подписки-интервалы для других подсистем (idle callbacks, IntersectionObserver)
-      const workerSubs = new Map();
-      let subSeq = 0;
+      timersBackend = 'worker';
       workerTimerSupport = {
         every(ms, fn) {
           const id = 'sub:' + (++subSeq);
@@ -1916,95 +1988,143 @@
           return () => { workerSubs.delete(id); timerWorker.postMessage({ cmd: 'c', id }); };
         }
       };
-
       timerWorker.onmessage = (e) => {
         const sub = workerSubs.get(e.data);
         if (sub) { try { sub(); } catch (_) {} return; }
         const rec = recs.get(e.data);
-        if (!rec) return;
-        if (rec.iv) { fire(rec); return; }
-        recs.delete(e.data);
-        fire(rec);
+        if (rec && rec.mode === 'worker') fireRec(rec);
       };
-
-      const startNative = (rec) => {
-        rec.mode = 'native';
-        const delay = rec.iv ? rec.ms : Math.max(0, rec.due - Date.now());
-        rec.nativeId = rec.iv
-          ? nativeSI.call(window, () => fire(rec), delay)
-          : nativeST.call(window, () => fire(rec), delay);
-      };
-      const startWorker = (rec) => {
-        rec.mode = 'worker';
-        const delay = rec.iv ? rec.ms : Math.max(0, rec.due - Date.now());
-        timerWorker.postMessage({ cmd: 's', id: rec.id, ms: delay, iv: !!rec.iv });
-      };
-
-      const stopRec = (rec) => {
-        if (rec.mode === 'worker') timerWorker.postMessage({ cmd: 'c', id: rec.id });
-        else {
-          nativeCT.call(window, rec.nativeId);
-          nativeCI.call(window, rec.nativeId);
-        }
-      };
-
-      // Миграция таймеров при смене реальной видимости (подписка ДО suppressor)
-      visHooks.push((hidden) => {
-        for (const rec of Array.from(recs.values())) {
-          if (hidden && rec.mode === 'native') {
-            stopRec(rec);
-            startWorker(rec);
-          } else if (!hidden && rec.mode === 'worker') {
-            stopRec(rec);
-            startNative(rec);
-          }
-        }
-      });
-
-      const patchedST = maskFn(makeMethod('setTimeout', function (cb, delay, ...args) {
-        if (typeof cb !== 'function') return nativeST.call(window, cb, delay, ...args);
-        const ms = Math.max(0, Number(delay) || 0);
-        if (ms > 2147483646) return nativeST.call(window, cb, delay, ...args);
-        const rec = { cb, ms, iv: false, args, due: Date.now() + ms, id: ++seq };
-        recs.set(rec.id, rec);
-        if (realHidden()) startWorker(rec); else startNative(rec);
-        return rec.id;
-      }), 'function setTimeout() { [native code] }');
-      setFnMeta(patchedST, 'setTimeout', 1);
-      window.setTimeout = patchedST;
-
-      const patchedSI = maskFn(makeMethod('setInterval', function (cb, delay, ...args) {
-        if (typeof cb !== 'function') return nativeSI.call(window, cb, delay, ...args);
-        const ms = Math.max(0, Number(delay) || 0);
-        if (ms > 2147483646) return nativeSI.call(window, cb, delay, ...args);
-        const rec = { cb, ms, iv: true, args, due: Date.now() + ms, id: ++seq };
-        recs.set(rec.id, rec);
-        if (realHidden()) startWorker(rec); else startNative(rec);
-        return rec.id;
-      }), 'function setInterval() { [native code] }');
-      setFnMeta(patchedSI, 'setInterval', 1);
-      window.setInterval = patchedSI;
-
-      const clearManaged = (id, nativeClear) => {
-        const rec = recs.get(id);
-        if (!rec) return false;
-        recs.delete(id);
-        stopRec(rec);
-        return true;
-      };
-
-      const patchedCT = maskFn(makeMethod('clearTimeout', function (id) {
-        if (!clearManaged(id, nativeCT)) return nativeCT.call(window, id);
-      }), 'function clearTimeout() { [native code] }');
-      setFnMeta(patchedCT, 'clearTimeout', 1);
-      window.clearTimeout = patchedCT;
-
-      const patchedCI = maskFn(makeMethod('clearInterval', function (id) {
-        if (!clearManaged(id, nativeCI)) return nativeCI.call(window, id);
-      }), 'function clearInterval() { [native code] }');
-      setFnMeta(patchedCI, 'clearInterval', 1);
-      window.clearInterval = patchedCI;
+    } else {
+      // CSP сайта может запрещать blob:-Worker (worker-src/script-src). Резерв:
+      // MessageChannel — задачи порта не троттлятся как DOM-таймеры. Дороже по CPU,
+      // поэтому только last resort.
+      try {
+        const mc = new MessageChannel();
+        mc.port1.onmessage = (e) => {
+          mcActive = false;
+          const rec = recs.get(e.data);
+          if (rec && rec.mode === 'worker') fireRec(rec);
+          mcKick();
+        };
+        if (typeof mc.port1.start === 'function') mc.port1.start();
+        mcPort = mc;
+        timersBackend = 'messagechannel';
+      } catch (_) { mcPort = null; }
     }
+    if (timersBackend) timersNormalized = true;
+
+    function scheduleRec(rec) {
+      // Задержка считается от АБСОЛЮТНОГО rec.next: при миграции между бэкендами
+      // фаза таймера не сбивается (фикс "поздних тиков" при Alt+Tab).
+      const delay = Math.max(0, rec.next - Date.now());
+      if (rec.mode === 'native') {
+        rec.handle = nativeST.call(window, () => fireRec(rec), delay);
+      } else if (timerWorker) {
+        timerWorker.postMessage({ cmd: 's', id: rec.id, ms: delay, iv: false });
+      } else {
+        mcKick();
+      }
+    }
+
+    function fireRec(rec) {
+      if (recs.get(rec.id) !== rec) return;
+      fireCb(rec);
+      if (recs.get(rec.id) !== rec) return; // колбэк отменил сам себя
+      if (rec.iv) {
+        const now = Date.now();
+        // Опоздали больше чем на 50мс (стол/троттлинг) — выравниваем дельту:
+        // следующий тик строго через ms, чтобы страница не видела серию аномалий.
+        rec.next = now > rec.next + 50 ? now + rec.ms : rec.next + rec.ms;
+        scheduleRec(rec);
+      } else {
+        recs.delete(rec.id);
+      }
+    }
+
+    function mcKick() {
+      if (!mcPort || mcActive) return;
+      let soonest = null;
+      for (const r of recs.values()) {
+        if (r.mode === 'worker' && (!soonest || r.next < soonest.next)) soonest = r;
+      }
+      if (!soonest) return;
+      mcActive = true;
+      mcPort.port2.postMessage(soonest.id);
+    }
+
+    function stopRec(rec) {
+      if (rec.mode === 'native') nativeCT.call(window, rec.handle);
+      else if (timerWorker) timerWorker.postMessage({ cmd: 'c', id: rec.id });
+      // mc-бэкенд: отмена не нужна — onmessage пропустит удалённый rec
+    }
+
+    function useBackend(rec, mode) {
+      if (rec.mode === mode) return;
+      stopRec(rec);
+      rec.mode = mode;
+      scheduleRec(rec);
+    }
+
+    // Миграция при смене реальной видимости (подписка ДО suppressor)
+    visHooks.push((hidden) => {
+      // Gecko с играющим (даже беззвучным) AudioContext не троттлит ТАЙМЕРЫ ВООБЩЕ
+      // (IsPlayingAudio в TimeoutManager), причём троттлит и worker'ы тоже — поэтому
+      // остаёмся на нативных таймерах: они точнее. Иначе (Chrome/без аудио) — worker.
+      const audioExempt = !!(audioRunningFn && audioRunningFn());
+      const mode = hidden && !audioExempt ? 'worker' : 'native';
+      for (const rec of Array.from(recs.values())) useBackend(rec, mode);
+    });
+
+    const makeRec = (cb, ms, args, iv) => {
+      const rec = {
+        cb, ms, iv, args,
+        next: Date.now() + ms,
+        id: ++seq,
+        mode: realHidden() ? 'worker' : 'native',
+        handle: 0
+      };
+      recs.set(rec.id, rec);
+      scheduleRec(rec);
+      return rec.id;
+    };
+
+    const patchedST = maskFn(makeMethod('setTimeout', function (cb, delay, ...args) {
+      if (typeof cb !== 'function') return nativeST.call(window, cb, delay, ...args);
+      const ms = Math.max(0, Number(delay) || 0);
+      if (ms > 2147483646) return nativeST.call(window, cb, delay, ...args);
+      return makeRec(cb, ms, args, false);
+    }), 'function setTimeout() { [native code] }');
+    setFnMeta(patchedST, 'setTimeout', 1);
+    window.setTimeout = patchedST;
+
+    const patchedSI = maskFn(makeMethod('setInterval', function (cb, delay, ...args) {
+      if (typeof cb !== 'function') return nativeSI.call(window, cb, delay, ...args);
+      const ms = Math.max(0, Number(delay) || 0);
+      if (ms > 2147483646) return nativeSI.call(window, cb, delay, ...args);
+      return makeRec(cb, ms, args, true);
+    }), 'function setInterval() { [native code] }');
+    setFnMeta(patchedSI, 'setInterval', 1);
+    window.setInterval = patchedSI;
+
+    const clearManaged = (id) => {
+      const rec = recs.get(id);
+      if (!rec) return false;
+      recs.delete(id);
+      stopRec(rec);
+      return true;
+    };
+
+    const patchedCT = maskFn(makeMethod('clearTimeout', function (id) {
+      if (!clearManaged(id)) return nativeCT.call(window, id);
+    }), 'function clearTimeout() { [native code] }');
+    setFnMeta(patchedCT, 'clearTimeout', 1);
+    window.clearTimeout = patchedCT;
+
+    const patchedCI = maskFn(makeMethod('clearInterval', function (id) {
+      if (!clearManaged(id)) return nativeCI.call(window, id);
+    }), 'function clearInterval() { [native code] }');
+    setFnMeta(patchedCI, 'clearInterval', 1);
+    window.clearInterval = patchedCI;
   }
 
   /* ==================== 16c. REQUESTIDLECALLBACK В СКРЫТОЙ ВКЛАДКЕ ====================
@@ -2163,6 +2283,59 @@
         NativeIO.prototype.disconnect = patchedIODisconnect;
       }
     } catch (_) {}
+  }
+
+  /* ==================== 16e. AUDIO KEEP-ALIVE (FIREFOX АНТИ-ТРОТТЛИНГ) ====================
+     Firefox не применяет троттлинг таймеров к вкладке "с играющим аудио":
+     TimeoutManager проверяет IsPlayingAudio(), куда входит AudioContext в состоянии
+     running — независимо от громкости. Осциллятор с gain=0 держит контекст running
+     и полностью отключает троттлинг скрытой вкладки (включая worker'ы).
+     Autoplay-политика требует жеста: контекст создаётся сразу (suspended),
+     resume() на первом клике/клавише через нативные слушатели.                  */
+  if (CFG.audioKeepAlive && typeof AudioContext !== 'undefined' && !audioRunningFn) {
+    let audioCtx = null;
+    let audioFailed = false;
+
+    const buildAudio = () => {
+      if (audioCtx || audioFailed) return;
+      try {
+        audioCtx = new AudioContext();
+        const osc = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+        gain.gain.value = 0; // полная тишина: беззвучно для пользователя и индикатора вкладки
+        osc.connect(gain);
+        gain.connect(audioCtx.destination);
+        osc.start();
+      } catch (_) {
+        audioCtx = null;
+        audioFailed = true;
+      }
+    };
+
+    const resumeAudio = () => {
+      buildAudio();
+      try {
+        if (audioCtx && audioCtx.state === 'suspended') {
+          const p = audioCtx.resume();
+          if (p && typeof p.catch === 'function') p.catch(() => {});
+        }
+      } catch (_) {}
+    };
+
+    audioRunningFn = () => {
+      try { return !!(audioCtx && audioCtx.state === 'running'); } catch (_) { return false; }
+    };
+
+    // Жесты через нативные слушатели (страница их не видит)
+    ['pointerdown', 'mousedown', 'keydown', 'touchstart'].forEach((type) => {
+      try { nativeAdd.call(window, type, resumeAudio, { capture: true, passive: true }); } catch (_) {}
+      try { nativeAdd.call(document, type, resumeAudio, { capture: true, passive: true }); } catch (_) {}
+    });
+
+    // При возврате во вкладку — подстраховка, если контекст затормозили
+    visHooks.push((hidden) => { if (!hidden) resumeAudio(); });
+
+    buildAudio(); // сразу suspended; станет running на первом жесте
   }
 
   /* ==================== 17. ЗАЩИТА СОСЕДНИХ РИЛМОВ (IFRAMES) ==================== */
@@ -2415,7 +2588,7 @@
 
   /* ==================== 19. ПУБЛИЧНОЕ УПРАВЛЕНИЕ И ОТЛАДКА ==================== */
   const api = {
-    version: '3.2.0',
+    version: '3.5.0',
     cfg: CFG,
     toggle: toggleFullscreenMode,
     enable: () => {
@@ -2430,19 +2603,26 @@
     toggleBlur: toggleBlurMode,
     get isSessionActive() { return sessionActive; },
     get isSpoofActive() { return isSpoofActive(); },
+    get sessionMode() { return sessionMode; },
     get fakeFullscreenElement() { return fakeFullscreenEl; },
     get realFullscreenElement() { return realFullscreenElement(); },
     get lastRealExit() { return lastRealExit; },
     get suppressed() { return suppressedCount; },
     status: () => ({
-      version: '3.2.0',
+      version: '3.5.0',
       sessionActive,
       isSpoofActive: isSpoofActive(),
+      sessionMode,
       realFullscreen: !!realFullscreenElement(),
       fakeElement: fakeFullscreenEl,
       smartBlur: CFG.smartBlur,
       visibility: CFG.visibility,
       timersNormalized,
+      timersBackend,
+      audioKeepAlive: (() => {
+        try { return audioRunningFn ? (audioRunningFn() ? 'running' : 'suspended') : null; }
+        catch (_) { return null; }
+      })(),
       isTopFrame,
       suppressedCount
     })
@@ -2452,5 +2632,5 @@
     Object.defineProperty(window, '__fseBypass', { value: api, writable: true, enumerable: false, configurable: true });
   } catch (_) { window.__fseBypass = api; }
 
-  dbg('v3.2.0 active on', location.href);
+  dbg('v3.5.0 active on', location.href);
 })();
